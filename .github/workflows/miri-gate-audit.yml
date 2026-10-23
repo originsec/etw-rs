@@ -1,0 +1,121 @@
+name: Miri gate audit
+
+# Finds Miri gates that have gone stale — tests marked
+# `#[cfg_attr(miri, ignore = "…")]` that no longer reach a Win32 call and could
+# now be interpreted.
+#
+# Run this by hand after a change that moves Win32 calls between functions; that
+# is the only way a gate goes stale. Adding or removing a gate is already
+# visible without it: the per-PR Miri job prints the ignored count, so a change
+# to that number shows up in the diff that caused it.
+#
+# On demand rather than scheduled, deliberately. The rot this repo actually
+# suffered was the opposite mistake — tests drifting into Win32 calls with no
+# marker — and the per-PR job catches that immediately, because Miri aborts the
+# whole binary and turns CI red. Stale gates are far rarer, and a periodic job
+# that passes for a year running gets ignored, then muted the first time it
+# fails for an unrelated reason. A watchdog nobody reads is worse than none.
+#
+# It cannot be a per-PR job regardless: Miri aborts on the first foreign call,
+# so every ignored test needs its own process, and the sweep is far too slow for
+# the critical path.
+#
+# Known false positive: `--list --ignored` cannot tell a Miri gate from an
+# ordinary `#[ignore]`. The audited targets contain no plain `#[ignore]` today,
+# but a slow or admin-only test added to one of them would be probed too, and
+# reported as a stale gate if it happens to be pure logic.
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: windows-latest
+    # The sweep runs Miri once per ignored test; bounded well above the ~15
+    # minutes it takes today so a hang cannot burn a full 6-hour default.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ hashFiles('ci/check.ps1') }}
+
+      - name: Probe each Miri-ignored test
+        shell: bash
+        env:
+          # Same flag as check.ps1's `miri` step, which says why it is needed.
+          MIRIFLAGS: -Zmiri-permissive-provenance
+        run: |
+          # Installs and names the same pinned toolchain as ci.yml's `miri` job.
+          TC="+$(powershell -NoProfile -File ci/check.ps1 -Toolchain miri)"
+          # Only targets that can contain `ignore`-marked tests. Integration
+          # files gated with a file-level `#![cfg(not(miri))]` are invisible
+          # here by construction — see AGENTS.md.
+          TARGETS=(
+            "-p etw-rs --lib"
+            "-p etw-rs --test validate_next_version_hints"
+            "-p etw-rs-generate-provider --lib"
+            "-p etw-rs-generate-provider --test generate_provider"
+          )
+          # A probe is only meaningful with three outcomes, not two. Treating
+          # "cargo did not report a pass" as "the gate is still needed" makes a
+          # broken toolchain or a compile error look identical to a working
+          # audit, and the job reports success having checked nothing. Each
+          # probe must therefore land in exactly one of: passed (stale gate),
+          # aborted on a foreign call (gate still required), or unrecognised
+          # (the audit itself is broken).
+          stale=0
+          broken=0
+          probed=0
+
+          # `shell: bash` runs with -eo pipefail, so a target with no ignored
+          # tests would otherwise kill the step: grep exits 1 on no match,
+          # pipefail propagates it, and the failing command substitution trips
+          # -e. Hence the `|| true` around grep.
+          for t in "${TARGETS[@]}"; do
+            if ! listing=$(cargo $TC miri test $t -- --list --ignored 2>&1); then
+              echo "::error::could not list ignored tests for '$t' — the audit did not run"
+              echo "$listing" | tail -20
+              broken=1
+              continue
+            fi
+            names=$(echo "$listing" | { grep ': test$' || true; } | sed 's/: test$//')
+            if [ -z "$names" ]; then
+              echo "no ignored tests in: $t"
+              continue
+            fi
+            for n in $names; do
+              probed=$((probed + 1))
+              out=$(cargo $TC miri test $t -- --exact "$n" --include-ignored 2>&1 || true)
+              if echo "$out" | grep -q 'test result: ok. 1 passed'; then
+                echo "::error::stale Miri gate: $n passes under Miri — remove its #[cfg_attr(miri, ignore = ...)]"
+                stale=1
+              elif echo "$out" | grep -qE "unsupported operation|can't call foreign function"; then
+                echo "still needs its gate: $n"
+              else
+                echo "::error::could not classify '$n' — neither passed nor hit a foreign call"
+                echo "$out" | tail -20
+                broken=1
+              fi
+            done
+          done
+
+          if [ "$probed" -eq 0 ]; then
+            echo "::error::no ignored tests were probed at all — the target list is stale or the build is broken"
+            exit 1
+          fi
+          if [ "$broken" -ne 0 ]; then
+            echo "The audit could not complete; its result says nothing about gate staleness."
+            exit 1
+          fi
+          if [ "$stale" -ne 0 ]; then
+            echo "One or more Miri gates are stale; see the errors above."
+            exit 1
+          fi
+          echo "All $probed Miri gates still required."

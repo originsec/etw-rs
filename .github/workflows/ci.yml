@@ -1,0 +1,125 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Each Windows job is one step of ci/check.ps1, which holds the toolchain pins
+# and installs them through rustup, so contributors run exactly what CI runs.
+# rust-cache keys on the runner's default rustc, not the pinned one, so the
+# script's hash is in the key: bumping a pin starts a fresh cache.
+jobs:
+  format:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Format
+        run: ./ci/check.ps1 fmt
+
+  # Pure greps, so no toolchain and no Windows runner — ubuntu is billed at 1x
+  # rather than 2x, and this lands in seconds instead of behind a build.
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Doc examples must stay compile-checked; an `ignore` fence rots silently.
+      # Use `no_run`, `compile_fail`, or hidden `#` lines. A `text` fence is for
+      # genuinely non-Rust blocks (wire layouts, CLI usage) and is not a way to
+      # smuggle uncompiled Rust past this check.
+      - name: Doc example fences
+        run: |
+          if grep -rn --include='*.rs' --exclude-dir=target '```ignore' .; then
+            echo "::error::ignore-fenced doc example found; use no_run, compile_fail, or hidden '#' lines"
+            exit 1
+          fi
+          echo "No ignore-fenced doc examples"
+
+      # `--ignored` runs *only* the ignored tests, so a documented
+      # `cargo test -- --ignored` silently skips the default pass. Matching the
+      # literal `-- --ignored` catches the command form without tripping on prose
+      # that names the flag, and cannot match `-- --include-ignored`.
+      - name: Doc test-invocation flags
+        run: |
+          if grep -rn --include='*.md' --exclude-dir=target -e '-- --ignored' .; then
+            echo "::error::documented 'cargo test -- --ignored' skips the default pass; use --include-ignored"
+            exit 1
+          fi
+          echo "No --ignored/--include-ignored mix-ups"
+
+      # `slow` is the only reason a test may be excluded from the default pass,
+      # and the rule had drifted before: four tests sat behind
+      # `#[ignore = "generates real DNS traffic"]` while tests/README.md said
+      # otherwise, so a reader could not tell what a green `cargo test` covered.
+      #
+      # Secondary, and worth stating as secondary: `miri-gate-audit.yml` probes
+      # ignored tests to find stale Miri gates and cannot tell one from a plain
+      # `#[ignore]`, so it records that as a known false positive — true only
+      # while this holds. That workflow is `workflow_dispatch` only, so it
+      # benefits from the rule rather than depending on it per PR. The reason
+      # this check exists is the convention itself.
+      #
+      # `#[cfg_attr(miri, ignore = "…")]` is a different thing and unrestricted:
+      # its reason names the Win32 call that would abort the Miri run.
+      - name: Only slow tests are ignored
+        run: |
+          # Anchored to the start of a line so an attribute matches but a
+          # mention of one inside a comment or doc string does not.
+          if grep -rnE '^[[:space:]]*#\[ignore' --include='*.rs' --exclude-dir=target . \
+               | grep -v '#\[ignore = "slow"\]'; then
+            echo "::error::#[ignore] with a reason other than \"slow\" — make the test run, or justify it as slow"
+            exit 1
+          fi
+          echo "Only slow tests are ignored"
+
+  lint:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ hashFiles('ci/check.ps1') }}
+      - name: Clippy and rustdoc
+        run: ./ci/check.ps1 lint
+
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ hashFiles('ci/check.ps1') }}
+      # GitHub-hosted windows-latest runners execute as Administrator, so the
+      # privileged tests run rather than tripping the admin guard.
+      - name: Tests, doc tests, benchmarks compile
+        run: ./ci/check.ps1 test
+
+  msrv:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ hashFiles('ci/check.ps1') }}
+      - name: Check against the declared MSRV
+        run: ./ci/check.ps1 msrv
+
+  # Interprets the raw-pointer work — provenance, alignment, aliasing — that
+  # clippy and the normal test pass cannot see.
+  miri:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ hashFiles('ci/check.ps1') }}
+      - name: Miri
+        run: ./ci/check.ps1 miri

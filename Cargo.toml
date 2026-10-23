@@ -1,0 +1,259 @@
+[workspace]
+members = [".", "etw-rs-macros", "example-providers", "tools/generate-provider"]
+resolver = "2"
+
+[workspace.package]
+# Verified by the `msrv` CI job, not asserted. 1.88 is the floor because
+# etw-rs-macros uses let-chains, stable from 1.88; edition 2024 alone would only
+# require 1.85.
+rust-version = "1.88"
+
+[package]
+name = "etw-rs"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+authors = ["John Uhlmann <john@originhq.com>"]
+license = "Apache-2.0"
+description = "Rust bindings for Event Tracing for Windows (ETW) with minimal abstraction"
+repository = "https://github.com/originsec/etw-rs"
+readme = "README.md"
+keywords = ["etw", "event", "tracing", "windows"]
+categories = ["os::windows-apis"]
+# Package only the library. Examples, tests, and benches all depend on the
+# unpublished example-providers workspace crate, so they could not compile
+# from the .crate file anyway; cargo strips their target sections at package
+# time. README and LICENSE are listed to keep them without a force-include
+# warning.
+include = ["/src", "/README.md", "/CHANGELOG.md", "/LICENSE"]
+# Library only: the CLI is the separate etw-rs-generate-provider crate.
+autobins = false
+
+[dependencies]
+# `version` is what crates.io consumers resolve; `path` wins for local builds.
+etw-rs-macros = { path = "etw-rs-macros", version = "0.1.0" }
+log = "0.4"
+rustc-hash = "2.0"
+thiserror = "2"
+# The raw-ABI sibling of the `windows` crate: same generated declarations,
+# no wrapper methods and no proc-macro machinery, so consumers compile a
+# fraction of the code. No windows-sys type crosses the public API, so
+# bumping this is a patch-level change.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_System_Diagnostics_Debug", # FormatMessageW for error rendering
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_JobObjects",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+anyhow = "1"
+criterion = "0.5"
+ctrlc = "3.4"
+env_logger = "0.11"
+example-providers = { path = "example-providers" }
+ferrisetw = "1.2"
+# `#[serial(<key>)]` per-test serialisation for integration tests that use
+# the limited system logger slots. Lets unrelated tests run in parallel.
+serial_test = "3"
+tracelogging_dynamic = "1.2.4"
+# Tests, benches, and examples keep the full `windows` crate for its
+# conveniences (EVENT_RECORD mocks, typed constants, `FileTimeToSystemTime`
+# as the oracle in `tests/differential_filetime.rs`). Dev-only: consumers
+# never see it.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_JobObjects",
+    "Win32_System_Memory",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_System_Time",
+] }
+
+# Debug symbols in bench binaries so a profiler can attribute samples to
+# individual parser functions (M-HOTPATH). Does not affect optimisation level,
+# so measured timings are unchanged.
+[profile.bench]
+debug = 1
+
+[[bench]]
+name = "parsing"
+harness = false
+
+[[bench]]
+name = "comparison"
+harness = false
+
+[[bench]]
+name = "parser_comparison"
+harness = false
+
+[[bench]]
+name = "rundown_parsing"
+harness = false
+
+[[bench]]
+name = "live_events"
+harness = false
+
+[features]
+default = []
+
+[lib]
+name = "etw"
+path = "src/lib.rs"
+
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"
+targets = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]
+
+[target.'cfg(not(windows))'.dependencies]
+# Placeholder to allow docs.rs to build on non-Windows platforms
+
+[[example]]
+name = "01_simple_trace"
+path = "examples/01_simple_trace.rs"
+
+[[example]]
+name = "02_static_schema"
+path = "examples/02_static_schema.rs"
+
+[[example]]
+name = "03_typical_trace"
+path = "examples/03_typical_trace.rs"
+
+[[example]]
+name = "04_extended_data"
+path = "examples/04_extended_data.rs"
+
+[[example]]
+name = "05_delayed_stack_walks"
+path = "examples/05_delayed_stack_walks.rs"
+
+[[example]]
+name = "06_rundown_events"
+path = "examples/06_rundown_events.rs"
+
+[[example]]
+name = "07_manual"
+path = "examples/07_manual.rs"
+
+[[example]]
+name = "10_simple_system_trace"
+path = "examples/10_simple_system_trace.rs"
+
+[[example]]
+name = "11_typical_system_trace"
+path = "examples/11_typical_system_trace.rs"
+
+[[example]]
+name = "12_last_branch_records"
+path = "examples/12_last_branch_records.rs"
+
+[[example]]
+name = "13_system_logger_rundown"
+path = "examples/13_system_logger_rundown.rs"
+
+[[example]]
+name = "14_system_providers"
+path = "examples/14_system_providers.rs"
+
+[lints]
+workspace = true
+
+# Shared by every published crate via `[lints] workspace = true`
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"                  # All public items must be documented
+unreachable_pub = "warn"               # Catch pub items that should be pub(crate)
+missing_debug_implementations = "warn" # All public types must impl Debug
+# Future: uncomment when stabilized
+# unsafe_attr_outside_unsafe = "deny"
+
+# Clippy: Enable strict linting with documented exceptions
+# Run `./ci/check.ps1 lint` to check
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+
+# Restriction lints (cherry-picked for safety)
+dbg_macro = "warn"                  # No debug macros in production
+print_stdout = "warn"               # Use log crate, not println (except examples)
+print_stderr = "warn"               # Use log crate, not eprintln
+unwrap_used = "warn"                # Prefer expect() or proper error handling
+expect_used = "warn"                # Prefer proper error handling over expect()
+todo = "warn"                       # No TODOs in committed code
+unimplemented = "warn"              # No unimplemented!() in committed code
+as_underscore = "warn"              # `as _` hides the target type
+clone_on_ref_ptr = "warn"           # Cloning Arc/Rc should be explicit
+empty_structs_with_brackets = "warn" # Use `struct Foo;` not `struct Foo {}`
+format_push_string = "warn"         # Use write! instead of format! + push_str
+if_then_some_else_none = "warn"     # Use .then() or .then_some()
+mixed_read_write_in_expression = "warn" # Avoid confusing read/write in same expr
+needless_raw_strings = "warn"       # Don't use r"" when not needed
+redundant_type_annotations = "warn" # Remove redundant type annotations
+rest_pat_in_fully_bound_structs = "warn" # Don't use .. when all fields bound
+semicolon_outside_block = "warn"    # Consistent semicolon placement
+try_err = "warn"                    # Avoid Err(e)? — use return Err(e) directly
+unnecessary_safety_comment = "warn" # Remove outdated SAFETY comments
+unnecessary_safety_doc = "warn"     # Remove outdated # Safety docs
+mem_forget = "warn"                 # mem::forget can leak resources
+undocumented_unsafe_blocks = "warn" # All unsafe blocks need SAFETY comments
+str_to_string = "warn"              # Use .to_owned() instead of .to_string() on &str
+implicit_clone = "warn"              # Prefer explicit .clone() over .to_owned()/.to_vec() on Clone types
+rc_mutex = "warn"                   # Rc<Mutex<T>> is usually wrong
+self_named_module_files = "warn"    # Use mod.rs style, not foo/foo.rs
+
+# Additional restriction lints (practical safety/correctness)
+cfg_not_test = "warn"               # #[cfg(not(test))] is almost always wrong — prefer #[cfg(test)]
+empty_enum_variants_with_brackets = "warn" # Use `Variant` not `Variant {}`
+float_cmp_const = "warn"            # Don't compare floats with == to constants
+fn_to_numeric_cast_any = "warn"     # Casting function pointers to numbers is suspicious
+get_unwrap = "warn"                 # Use [] indexing or .get().expect() instead of .get().unwrap()
+infinite_loop = "warn"              # Detect infinite loops that could be `loop {}`
+mutex_atomic = "warn"               # Use atomics instead of Mutex for single values
+partial_pub_fields = "warn"         # Struct with mix of pub/private fields is suspicious
+pub_without_shorthand = "warn"      # Use `pub(crate)` not `pub(in crate)`
+renamed_function_params = "warn"    # Params renamed in impl vs trait definition
+same_name_method = "warn"           # Method has same name as method from trait in scope
+unnecessary_self_imports = "warn"   # Don't use `use foo::{self}` when unnecessary
+verbose_file_reads = "warn"         # Use fs::read_to_string instead of File+read_to_string
+
+# Cherry-picked nursery lints
+transmute_undefined_repr = "warn"   # Transmuting ETW buffers needs a defined repr
+trailing_empty_array = "warn"       # C trailing-array structs are a parsing hazard
+debug_assert_with_mut_call = "warn" # debug_assert! must not have side effects
+redundant_clone = "warn"            # Clones on the event path are not free
+use_self = "warn"                   # Prefer Self over repeating the type name
+missing_const_for_fn = "warn"       # Prefer const fn where the body allows it
+needless_pass_by_ref_mut = "warn"   # &mut that is never used mutably
+
+# Allowed pedantic: These lints are too noisy for practical use
+missing_errors_doc = "allow"        # Error docs would be repetitive
+missing_panics_doc = "allow"        # Panic docs would be repetitive
+module_name_repetitions = "allow"   # e.g., session::Trace is fine
+must_use_candidate = "allow"        # Too many false positives
+too_many_lines = "allow"            # Functions can be long when clear
+similar_names = "allow"             # e.g., data1/data2/data3 in GUIDs
+unreadable_literal = "allow"        # GUIDs use standard hex format
+cast_possible_truncation = "allow"  # Win32 APIs require casts
+cast_sign_loss = "allow"            # Win32 APIs require casts
+cast_possible_wrap = "allow"        # Win32 APIs require casts
+cast_lossless = "allow"             # Win32 FFI requires pervasive as-casts; From:: churn adds no value
+doc_markdown = "allow"              # TraceLogging etc. don't need backticks
+items_after_statements = "allow"    # Local consts/structs near their use
+cast_ptr_alignment = "allow"        # ETW structures have known alignment — see docs/etw_buffer_alignment.md

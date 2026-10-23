@@ -1,0 +1,5 @@
+# Ensure Rust source files always use LF line endings (required by rustfmt newline_style = "Unix")
+*.rs text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.md text eol=lf

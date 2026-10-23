@@ -1,0 +1,24 @@
+[package]
+name = "etw-rs-macros"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+authors = ["John Uhlmann <john@originhq.com>"]
+license = "Apache-2.0"
+description = "Proc macros for etw-rs"
+repository = "https://github.com/originsec/etw-rs"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "3", features = ["full", "extra-traits"] }
+
+[dev-dependencies]
+etw-rs = { path = ".." }
+windows = { version = "0.62", features = ["Win32_Foundation"] }
+
+[lints]
+workspace = true

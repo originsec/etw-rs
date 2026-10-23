@@ -1,0 +1,23 @@
+[package]
+name = "example-providers"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+description = "Example ETW provider definitions for etw-rs examples and tests"
+
+# Deliberately windows-free: provider definitions and their generated TDH
+# validation tests reach Win32 only through etw-rs itself.
+[dependencies]
+etw-rs = { path = ".." }
+
+# This crate is pure provider-definition data with no unsafe of its own.
+[lints.rust]
+unsafe_code = "forbid"
+
+# Inherit key lints from the main crate
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+unreadable_literal = "allow"

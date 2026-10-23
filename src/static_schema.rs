@@ -1,0 +1,2419 @@
+//! Static schema parser with zero-cost field access.
+//!
+//! This module provides compile-time generated field accessors for ETW events through
+//! the `event_schema!` macro. Field names are used in source code for readability, but
+//! the compiler converts them to hardcoded offsets for maximum performance.
+//!
+//! # Performance
+//!
+//! - Fixed fields: <50ns per field access (vs ~500ns with [`EventParser`](crate::EventParser))
+//! - Variable fields: Lazy scanning on first access, cached for subsequent reads
+//! - Zero-copy string access via [`WideStrRef`] and [`AnsiStrRef`]
+//!
+//! # Alignment Guarantees
+//!
+//! ETW `EVENT_RECORD.UserData` is guaranteed 8-byte aligned for manifest-based
+//! and system logger events (see `docs/etw_buffer_alignment.md`). This means:
+//!
+//! - Fixed fields at even offsets from `UserData` base are u16-aligned
+//! - Fields at offsets divisible by 4 are u32-aligned
+//! - Fields at offset 0 are 8-byte aligned
+//!
+//! The parsing functions leverage this for zero-copy `&[u16]` string access
+//! and SIMD-friendly null-terminator scanning. A runtime pointer check gates
+//! each fast path, so correctness is maintained even when a wide string
+//! follows an odd-sized field (e.g., ANSI string or binary blob).
+//!
+//! # Design Philosophy
+//!
+//! - **Compile-time code generation**: Proc macro generates optimised parsing code
+//! - **Named + validated**: Field names for clarity, validation for correctness
+//! - **Zero runtime overhead**: All name resolution happens at compile time
+//! - **Incremental parsing**: Variable fields scanned lazily, only when accessed
+//!
+//! # Example
+//!
+//! ```no_run
+//! use etw::{Guid, RawEvent, event_schema};
+//!
+//! const GUID: Guid = Guid::from_u128(0xedd08927_9cc4_4e65_b970_c2560fb5c289);
+//!
+//! event_schema! {
+//!     guid: GUID,
+//!     name: "FileCreate",
+//!     id: 12,
+//!     version: 1,
+//!     fields: {
+//!         Irp: usize,
+//!         FileObject: usize,
+//!         IssuingThreadId: u32,
+//!         CreateOptions: u32,
+//!         CreateAttributes: u32,
+//!         ShareAccess: u32,
+//!         FileName: WideStrRef,
+//!     }
+//! }
+//!
+//! fn handle_file_create(event: &RawEvent) -> etw::Result<()> {
+//!     let mut parser = FileCreateV1Parser::new(event);
+//!
+//!     // Zero-cost fixed field access
+//!     let thread_id = parser.IssuingThreadId()?;
+//!     let options = parser.CreateOptions()?;
+//!
+//!     // Owned accessor — convenient, returns String
+//!     let filename = parser.FileName()?;
+//!
+//!     if filename.ends_with(".exe") {
+//!         println!("Thread {} created executable: {}", thread_id, filename);
+//!     }
+//!
+//!     // Zero-copy ref accessor — for hot paths, returns WideStrRef<'_>
+//!     let filename_ref = parser.FileName_ref()?;
+//!
+//!     if filename_ref.ends_with_ascii(".exe") {
+//!         println!("Thread {} created executable: {}", thread_id, filename_ref);
+//!     }
+//!
+//!     Ok(())
+//! }
+//! # fn main() {}
+//! ```
+
+use crate::{
+    Error, Result,
+    types::{AnsiStrRef, Guid, SidRef, SystemTime, WideStrRef},
+};
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Property Location Cache
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Cached location of a parsed property.
+///
+/// Static schema parsers use this structure to cache computed field offsets.
+/// This enables sequential scanning similar to [`EventParser`](crate::EventParser),
+/// where accessing field N automatically caches all fields 0..N as a side effect.
+///
+/// Unlike [`EventParser`](crate::EventParser)'s
+/// `PropertyLocation`, this struct only stores the offset. Size
+/// is not needed because:
+/// - Variable fields (strings, SIDs): Size not used during parsing
+/// - Fixed fields: Size is a compile-time constant
+///
+/// This reduces cache entry size from 16 bytes to 2 bytes, improving cache utilisation.
+#[derive(Debug, Clone, Copy)]
+pub struct PropertyLocation {
+    /// Byte offset from the start of the event user data buffer.
+    ///
+    /// Stored as u16 since ETW events are limited to 64KB (u16::MAX = 65535).
+    pub offset: u16,
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Fixed-Size Field Parsing
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Parse a fixed-size field at a known `offset` with the given `size` (zero overhead).
+///
+/// `data` is the raw event user data buffer. This function is designed to be
+/// fully inlined for maximum performance. When called with compile-time constant
+/// offsets, the compiler can optimise all bounds checks and produce code
+/// equivalent to direct struct field access.
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if the buffer is too small for the requested field.
+///
+/// # Example
+///
+/// ```no_run
+/// # fn example(data: &[u8]) -> etw::Result<()> {
+/// use etw::static_schema::parse_fixed;
+/// // Generated by event_schema! macro
+/// const OFFSET: usize = 16;
+/// const SIZE: usize = 4;
+/// let thread_id: u32 = parse_fixed(data, OFFSET, SIZE)?;
+/// # Ok(())
+/// # }
+/// ```
+#[inline]
+pub fn parse_fixed<T: FromBytes>(data: &[u8], offset: usize, size: usize) -> Result<T> {
+    if offset.saturating_add(size) > data.len() {
+        return Err(Error::parse("insufficient data for fixed field"));
+    }
+
+    Ok(T::from_bytes(&data[offset..offset + size]))
+}
+
+/// Parse a pointer-sized field at a known offset.
+///
+/// Reads `pointer_size` bytes (4 or 8) from the event data and zero-extends
+/// to `usize`. Used by generated static schema parsers for `Pointer` and
+/// `SizeT` typed fields where the event's pointer size may differ from the
+/// host's (e.g., 32-bit WOW64 process events consumed by a 64-bit host).
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if the buffer is too small.
+#[inline]
+#[expect(
+    clippy::unwrap_used,
+    reason = "slice length pre-validated by bounds check"
+)]
+pub fn parse_pointer(data: &[u8], offset: usize, pointer_size: usize) -> Result<usize> {
+    if pointer_size != 4 && pointer_size != 8 {
+        return Err(Error::parse(format!(
+            "pointer_size must be 4 or 8, got {pointer_size}"
+        )));
+    }
+    if offset.saturating_add(pointer_size) > data.len() {
+        return Err(Error::parse("insufficient data for pointer field"));
+    }
+    Ok(match pointer_size {
+        4 => u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize,
+        _ => u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize,
+    })
+}
+
+/// Parse a signed pointer-sized field at a known offset.
+///
+/// Reads `pointer_size` bytes (4 or 8) from the event data and sign-extends
+/// to `isize`. Used by generated static schema parsers for signed pointer
+/// fields where the event's pointer size may differ from the host's.
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if the buffer is too small.
+#[inline]
+#[expect(
+    clippy::unwrap_used,
+    reason = "slice length pre-validated by bounds check"
+)]
+pub fn parse_signed_pointer(data: &[u8], offset: usize, pointer_size: usize) -> Result<isize> {
+    if pointer_size != 4 && pointer_size != 8 {
+        return Err(Error::parse(format!(
+            "pointer_size must be 4 or 8, got {pointer_size}"
+        )));
+    }
+    if offset.saturating_add(pointer_size) > data.len() {
+        return Err(Error::parse("insufficient data for pointer field"));
+    }
+    Ok(match pointer_size {
+        4 => i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as isize,
+        _ => i64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as isize,
+    })
+}
+
+/// Extract the event's pointer size from a [`RawEvent`](crate::RawEvent).
+///
+/// Returns 4 for events from 32-bit processes (`EVENT_HEADER_FLAG_32_BIT_HEADER`)
+/// or 8 otherwise. Used by generated static schema parsers to correctly size
+/// `Pointer` and `SizeT` fields.
+#[inline]
+#[must_use]
+pub const fn pointer_size_from_event(event: &crate::RawEvent) -> usize {
+    // EVENT_HEADER_FLAG_32_BIT_HEADER = 0x20 (bit 5)
+    if event.as_raw().EventHeader.Flags & 0x20 != 0 {
+        4
+    } else {
+        8
+    }
+}
+
+/// Scan for a UTF-16 null terminator, returning the byte offset of the two `0x00` bytes.
+///
+/// When the data pointer is u16-aligned (the common case for ETW `UserData` — see
+/// `docs/etw_buffer_alignment.md`), this searches as `&[u16]` which LLVM can
+/// auto-vectorise. Falls back to a byte-pair scan when unaligned.
+///
+/// Returns `None` if no null terminator is found within `remaining`.
+#[inline]
+pub(crate) fn find_wide_null(remaining: &[u8]) -> Option<usize> {
+    // Fast path: when data is u16-aligned, search as &[u16].
+    // The compiler can auto-vectorise this (SIMD null-search).
+    if (remaining.as_ptr() as usize) & 1 == 0 {
+        let len = remaining.len() / 2;
+        // SAFETY: pointer is verified u16-aligned above, and `len` is
+        // `remaining.len() / 2` so the resulting slice is fully within bounds.
+        let wide = unsafe { std::slice::from_raw_parts(remaining.as_ptr().cast::<u16>(), len) };
+        if let Some(pos) = wide.iter().position(|&u| u == 0) {
+            return Some(pos * 2);
+        }
+        return None;
+    }
+    // Fallback: unaligned byte-pair scan.
+    let mut i = 0;
+    while i + 1 < remaining.len() {
+        if remaining[i] == 0 && remaining[i + 1] == 0 {
+            return Some(i);
+        }
+        i += 2;
+    }
+    None
+}
+
+/// Computes the size of a null-terminated UTF-16 string including the null terminator.
+///
+/// This function is used by static schema parsers during sequential scanning to compute
+/// property sizes for caching. It's similar to [`scan_past_wide_string`] but returns
+/// the size rather than the next offset.
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if `start_offset` is beyond the buffer.
+#[inline]
+pub fn compute_wide_string_size(data: &[u8], start_offset: usize) -> Result<usize> {
+    if start_offset >= data.len() {
+        return Err(Error::parse("start offset beyond buffer"));
+    }
+
+    let remaining = &data[start_offset..];
+
+    if let Some(null_pos) = find_wide_null(remaining) {
+        // Found null terminator — size includes it
+        return Ok(null_pos + 2);
+    }
+
+    // No null terminator found, return rest of buffer aligned to even boundary
+    Ok(remaining.len() & !1)
+}
+
+/// Computes the size of a null-terminated ANSI string including the null terminator.
+///
+/// This function is used by static schema parsers during sequential scanning to compute
+/// property sizes for caching.
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if `start_offset` is beyond the buffer.
+#[inline]
+pub fn compute_ansi_string_size(data: &[u8], start_offset: usize) -> Result<usize> {
+    if start_offset >= data.len() {
+        return Err(Error::parse("start offset beyond buffer"));
+    }
+
+    let remaining = &data[start_offset..];
+
+    // Scan for null terminator
+    if let Some(null_pos) = remaining.iter().position(|&b| b == 0) {
+        return Ok(null_pos + 1); // Include null terminator
+    }
+
+    // No null terminator found, return rest of buffer
+    Ok(remaining.len())
+}
+
+/// Parse a following variable-length null-terminated UTF-16 string (lazy scanning).
+///
+/// Scans from the given start offset to find the null terminator. The scan
+/// is performed lazily on first access and the result can be cached by the
+/// generated accessor macro.
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if `start_offset` is beyond the buffer.
+///
+/// # Example
+///
+/// ```no_run
+/// # fn example(data: &[u8]) -> etw::Result<()> {
+/// use etw::static_schema::parse_following_string;
+/// // Fixed fields end at offset 32, variable field follows
+/// let filename = parse_following_string(data, 32)?;
+/// # Ok(())
+/// # }
+/// ```
+#[inline]
+pub fn parse_following_string(data: &[u8], start_offset: usize) -> Result<WideStrRef<'_>> {
+    if start_offset >= data.len() {
+        return Err(Error::parse("start offset beyond buffer"));
+    }
+
+    let remaining = &data[start_offset..];
+
+    if let Some(null_pos) = find_wide_null(remaining) {
+        // Found null terminator — return string without it
+        return Ok(WideStrRef::new(&remaining[..null_pos]));
+    }
+
+    // No null terminator found, take rest of buffer
+    // (Some ETW events don't include null terminators)
+    let aligned_len = remaining.len() & !1; // Round down to even number
+    Ok(WideStrRef::new(&remaining[..aligned_len]))
+}
+
+/// Parse a wide string with a pre-computed size (no re-scanning).
+///
+/// This is an optimisation for sequential parsing where the string size has already
+/// been computed during offset caching. Avoids re-scanning for the null terminator.
+///
+/// The size_bytes parameter includes the null terminator (if present), which was already
+/// found during the initial scan that computed the size. No re-verification needed.
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if the buffer is too small.
+///
+/// # Example
+///
+/// ```no_run
+/// # fn example(data: &[u8]) -> etw::Result<()> {
+/// use etw::static_schema::parse_wide_string_sized;
+/// // Size already computed during caching: 88 bytes (including null)
+/// let filename = parse_wide_string_sized(data, 32, 88)?;
+/// # Ok(())
+/// # }
+/// ```
+#[inline]
+pub fn parse_wide_string_sized(
+    data: &[u8],
+    start_offset: usize,
+    size_bytes: usize,
+) -> Result<WideStrRef<'_>> {
+    if start_offset.saturating_add(size_bytes) > data.len() {
+        return Err(Error::parse("insufficient data for wide string"));
+    }
+
+    // Strip trailing NULL terminator if present. ETW can sometimes drop the
+    // NULL on the last property, so we must check before stripping.
+    let string_data = &data[start_offset..start_offset + size_bytes];
+    let content_len = if size_bytes >= 2 && string_data[size_bytes - 2..] == [0, 0] {
+        size_bytes - 2
+    } else {
+        // No NULL terminator — round down to even byte count for u16 alignment
+        size_bytes & !1
+    };
+
+    Ok(WideStrRef::new(
+        &data[start_offset..start_offset + content_len],
+    ))
+}
+
+/// Parse a following variable-length null-terminated ANSI string.
+///
+/// Similar to [`parse_following_string`] but for ANSI (single-byte) strings.
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if `start_offset` is beyond the buffer.
+#[inline]
+pub fn parse_following_ansi_string(data: &[u8], start_offset: usize) -> Result<AnsiStrRef<'_>> {
+    if start_offset >= data.len() {
+        return Err(Error::parse("start offset beyond buffer"));
+    }
+
+    let remaining = &data[start_offset..];
+
+    // Scan for null terminator
+    if let Some(null_pos) = remaining.iter().position(|&b| b == 0) {
+        return Ok(AnsiStrRef::new(&remaining[..null_pos]));
+    }
+
+    // No null terminator found, take rest of buffer
+    Ok(AnsiStrRef::new(remaining))
+}
+
+/// Parse an ANSI string with a pre-computed size (no re-scanning).
+///
+/// This is an optimisation for sequential parsing where the string size has already
+/// been computed during offset caching. Avoids re-scanning for the null terminator.
+///
+/// The size_bytes parameter includes the null terminator (if present), which was already
+/// found during the initial scan that computed the size. No re-verification needed.
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if the buffer is too small.
+#[inline]
+pub fn parse_ansi_string_sized(
+    data: &[u8],
+    start_offset: usize,
+    size_bytes: usize,
+) -> Result<AnsiStrRef<'_>> {
+    if start_offset.saturating_add(size_bytes) > data.len() {
+        return Err(Error::parse("insufficient data for ansi string"));
+    }
+
+    // Strip trailing NULL terminator if present. ETW can sometimes drop the
+    // NULL on the last property, so we must check before stripping.
+    let string_data = &data[start_offset..start_offset + size_bytes];
+    let content_len = if size_bytes >= 1 && string_data[size_bytes - 1] == 0 {
+        size_bytes - 1
+    } else {
+        size_bytes
+    };
+
+    Ok(AnsiStrRef::new(
+        &data[start_offset..start_offset + content_len],
+    ))
+}
+
+/// Scan past a null-terminated UTF-16 string and return the offset after it.
+///
+/// This is used when parsing multiple variable-length fields in sequence.
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if `start_offset` is beyond the buffer.
+///
+/// # Example
+///
+/// ```no_run
+/// # fn example(data: &[u8]) -> etw::Result<()> {
+/// use etw::static_schema::{parse_following_string, scan_past_wide_string};
+/// // Parse second variable field after first
+/// let field1_start = 32;
+/// let field2_start = scan_past_wide_string(data, field1_start)?;
+/// let field2 = parse_following_string(data, field2_start)?;
+/// # Ok(())
+/// # }
+/// ```
+#[inline]
+pub fn scan_past_wide_string(data: &[u8], start_offset: usize) -> Result<usize> {
+    if start_offset >= data.len() {
+        return Err(Error::parse("start offset beyond buffer"));
+    }
+
+    let remaining = &data[start_offset..];
+
+    if let Some(null_pos) = find_wide_null(remaining) {
+        // Found null terminator — return offset after it
+        return Ok(start_offset + null_pos + 2);
+    }
+
+    // No null terminator found, return end of buffer
+    Ok(data.len())
+}
+
+/// Scan past a null-terminated ANSI string and return the offset after it.
+///
+/// This is used when parsing multiple variable-length fields in sequence.
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if `start_offset` is beyond the buffer.
+#[inline]
+pub fn scan_past_ansi_string(data: &[u8], start_offset: usize) -> Result<usize> {
+    if start_offset >= data.len() {
+        return Err(Error::parse("start offset beyond buffer"));
+    }
+
+    let remaining = &data[start_offset..];
+
+    // Scan for null terminator
+    if let Some(null_pos) = remaining.iter().position(|&b| b == 0) {
+        return Ok(start_offset + null_pos + 1);
+    }
+
+    // No null terminator found, return end of buffer
+    Ok(data.len())
+}
+
+/// Parse a following Windows SID (Security Identifier).
+///
+/// A SID has a self-describing structure:
+/// - 1 byte: Revision
+/// - 1 byte: SubAuthorityCount (N)
+/// - 6 bytes: IdentifierAuthority
+/// - N * 4 bytes: SubAuthority array
+///
+/// Total size = 8 + (SubAuthorityCount * 4) bytes
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if the buffer is too small to contain a valid SID.
+///
+/// # Example
+///
+/// ```no_run
+/// # fn example(data: &[u8]) -> etw::Result<()> {
+/// use etw::static_schema::parse_following_sid;
+/// let sid_start = 48;
+/// let sid = parse_following_sid(data, sid_start)?;
+/// println!("SID revision: {}", sid.revision());
+/// # Ok(())
+/// # }
+/// ```
+#[inline]
+pub fn parse_following_sid(data: &[u8], start_offset: usize) -> Result<SidRef<'_>> {
+    let sid_size = compute_sid_size(data, start_offset)?;
+    // compute_sid_size already validates revision, sub-authority count, and bounds,
+    // so SidRef::new will always succeed here — the error arm is unreachable.
+    SidRef::new(&data[start_offset..start_offset + sid_size])
+        .ok_or_else(|| Error::parse("invalid SID structure"))
+}
+
+/// Parse a SID with a pre-computed size (no re-computation).
+///
+/// This is an optimisation for sequential parsing where the SID size has already
+/// been computed during offset caching.
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if the buffer is too small or SID is invalid.
+#[inline]
+pub fn parse_sid_sized(data: &[u8], start_offset: usize, size_bytes: usize) -> Result<SidRef<'_>> {
+    if start_offset.saturating_add(size_bytes) > data.len() {
+        return Err(Error::parse("insufficient data for SID"));
+    }
+
+    // Wrap the SID bytes in a SidRef
+    SidRef::new(&data[start_offset..start_offset + size_bytes])
+        .ok_or_else(|| Error::parse("invalid SID structure"))
+}
+
+/// Scan past a Windows SID (Security Identifier) and return the offset after it.
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if the buffer is too small, the revision byte
+/// is not 1, or `SubAuthorityCount` exceeds `SID_MAX_SUB_AUTHORITIES` (15).
+///
+/// # Example
+///
+/// ```no_run
+/// # fn example(data: &[u8]) -> etw::Result<()> {
+/// use etw::static_schema::{parse_following_string, scan_past_sid};
+/// let sid_start = 48;
+/// let next_field_start = scan_past_sid(data, sid_start)?;
+/// let image_name = parse_following_string(data, next_field_start)?;
+/// # Ok(())
+/// # }
+/// ```
+#[inline]
+pub fn scan_past_sid(data: &[u8], start_offset: usize) -> Result<usize> {
+    let sid_size = compute_sid_size(data, start_offset)?;
+    Ok(start_offset + sid_size)
+}
+
+/// Computes the byte size of a self-describing SID starting at `start_offset`.
+///
+/// Validates the SID revision byte and that `SubAuthorityCount` does not
+/// exceed `SID_MAX_SUB_AUTHORITIES` (15) per the Windows Security Reference.
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if the buffer is too small, the revision byte
+/// is not 1, or `SubAuthorityCount` exceeds 15.
+#[inline]
+pub fn compute_sid_size(data: &[u8], start_offset: usize) -> Result<usize> {
+    if start_offset.saturating_add(8) > data.len() {
+        return Err(Error::parse("insufficient data for SID header"));
+    }
+
+    // SID_REVISION (1) is the only valid revision.
+    if data[start_offset] != 1 {
+        return Err(Error::parse(format!(
+            "invalid SID revision {} (expected 1)",
+            data[start_offset]
+        )));
+    }
+
+    let sub_authority_count = data[start_offset + 1] as usize;
+    // SID_MAX_SUB_AUTHORITIES = 15 per the Windows Security Reference.
+    if sub_authority_count > 15 {
+        return Err(Error::parse(format!(
+            "SID SubAuthorityCount {sub_authority_count} exceeds SID_MAX_SUB_AUTHORITIES (15)"
+        )));
+    }
+
+    let sid_size = 8 + sub_authority_count * 4;
+    if start_offset.saturating_add(sid_size) > data.len() {
+        return Err(Error::parse(format!(
+            "insufficient data for SID: need {} bytes, have {} bytes",
+            sid_size,
+            data.len() - start_offset
+        )));
+    }
+
+    Ok(sid_size)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WbemSid (TOKEN_USER + SID) Field Parsing
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Size of the TOKEN_USER header that precedes the SID in WbemSid fields.
+///
+/// WbemSid fields (TDH InType 310) store a TOKEN_USER structure followed by
+/// the actual SID data. TOKEN_USER contains a SID_AND_ATTRIBUTES structure
+/// (pointer + DWORD). This assumes a 64-bit event — 8-byte pointer plus 4
+/// bytes of padding; a 32-bit event's 8-byte header is misread.
+const WBEM_SID_TOKEN_USER_SIZE: usize = 16;
+
+/// Computes the total byte size of a WbemSid field (TOKEN_USER header + SID).
+///
+/// WbemSid fields have a 16-byte TOKEN_USER prefix followed by a standard SID.
+/// The SID size is self-describing via its SubAuthorityCount field.
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if the buffer is too small.
+#[inline]
+pub fn compute_wbem_sid_size(data: &[u8], start_offset: usize) -> Result<usize> {
+    let sid_offset = start_offset + WBEM_SID_TOKEN_USER_SIZE;
+    let sid_size = compute_sid_size(data, sid_offset)?;
+    Ok(WBEM_SID_TOKEN_USER_SIZE + sid_size)
+}
+
+/// Parse a WbemSid field, skipping the TOKEN_USER header to return the SID.
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if the buffer is too small or the SID is invalid.
+#[inline]
+pub fn parse_wbem_sid(data: &[u8], start_offset: usize) -> Result<SidRef<'_>> {
+    let sid_offset = start_offset + WBEM_SID_TOKEN_USER_SIZE;
+    let sid_size = compute_sid_size(data, sid_offset)?;
+    SidRef::new(&data[sid_offset..sid_offset + sid_size])
+        .ok_or_else(|| Error::parse("invalid SID in WbemSid payload"))
+}
+
+/// Parse a WbemSid with a pre-computed total size (TOKEN_USER + SID).
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if the buffer is too small or the SID is invalid.
+#[inline]
+pub fn parse_wbem_sid_sized(
+    data: &[u8],
+    start_offset: usize,
+    size_bytes: usize,
+) -> Result<SidRef<'_>> {
+    if size_bytes < WBEM_SID_TOKEN_USER_SIZE {
+        return Err(Error::parse("WbemSid size too small for TOKEN_USER header"));
+    }
+    if start_offset.saturating_add(size_bytes) > data.len() {
+        return Err(Error::parse("insufficient data for WbemSid"));
+    }
+
+    let sid_offset = start_offset + WBEM_SID_TOKEN_USER_SIZE;
+    let sid_size = size_bytes - WBEM_SID_TOKEN_USER_SIZE;
+
+    SidRef::new(&data[sid_offset..sid_offset + sid_size])
+        .ok_or_else(|| Error::parse("invalid SID in WbemSid payload"))
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ManifestCounted Field Parsing (InTypes 22, 23, 25)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Computes the total byte size of a ManifestCounted field.
+///
+/// ManifestCounted fields (InTypes 22, 23, 25) use a 2-byte LE prefix encoding
+/// the **byte count** of the payload that follows. Total field size = 2 + value.
+///
+/// Shared by `ManifestCountedString`, `ManifestCountedAnsiString`, and
+/// `ManifestCountedBinary`.
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if the buffer is too small to read the prefix
+/// or the declared payload extends beyond the buffer.
+#[inline]
+pub fn compute_counted_size(data: &[u8], start_offset: usize) -> Result<usize> {
+    if start_offset.saturating_add(2) > data.len() {
+        return Err(Error::parse("insufficient data for counted field prefix"));
+    }
+
+    let byte_count = u16::from_le_bytes([data[start_offset], data[start_offset + 1]]) as usize;
+
+    let total = 2 + byte_count;
+    if start_offset.saturating_add(total) > data.len() {
+        return Err(Error::parse(format!(
+            "counted field declares {} bytes but only {} available",
+            byte_count,
+            data.len() - start_offset - 2
+        )));
+    }
+
+    Ok(total)
+}
+
+/// Parse a `ManifestCountedString` field with a pre-computed size.
+///
+/// Skips the 2-byte LE bytecount prefix and returns the UTF-16LE payload as a
+/// [`WideStrRef`]. `size_bytes` is the total field size including the prefix.
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if the buffer is too small or the payload has
+/// an odd byte count (UTF-16 requires an even number of bytes).
+#[inline]
+pub fn parse_counted_wide_string_sized(
+    data: &[u8],
+    start_offset: usize,
+    size_bytes: usize,
+) -> Result<WideStrRef<'_>> {
+    if start_offset.saturating_add(size_bytes) > data.len() {
+        return Err(Error::parse("insufficient data for counted wide string"));
+    }
+
+    // Payload starts after the 2-byte prefix.
+    let content_len = size_bytes.saturating_sub(2);
+
+    // UTF-16 payload must be an even number of bytes.
+    if content_len & 1 != 0 {
+        return Err(Error::parse(format!(
+            "ManifestCountedString has odd byte count ({content_len})"
+        )));
+    }
+
+    let content_start = start_offset + 2;
+
+    Ok(WideStrRef::new(
+        &data[content_start..content_start + content_len],
+    ))
+}
+
+/// Parse a `ManifestCountedAnsiString` field with a pre-computed size.
+///
+/// Skips the 2-byte LE bytecount prefix and returns the ANSI payload as an
+/// [`AnsiStrRef`]. `size_bytes` is the total field size including the prefix.
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if the buffer is too small.
+#[inline]
+pub fn parse_counted_ansi_string_sized(
+    data: &[u8],
+    start_offset: usize,
+    size_bytes: usize,
+) -> Result<AnsiStrRef<'_>> {
+    if start_offset.saturating_add(size_bytes) > data.len() {
+        return Err(Error::parse("insufficient data for counted ansi string"));
+    }
+
+    let content_start = start_offset + 2;
+    let content_len = size_bytes.saturating_sub(2);
+
+    Ok(AnsiStrRef::new(
+        &data[content_start..content_start + content_len],
+    ))
+}
+
+/// Parse a `ManifestCountedBinary` field with a pre-computed size.
+///
+/// Skips the 2-byte LE bytecount prefix and returns the raw payload bytes.
+/// `size_bytes` is the total field size including the prefix.
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if the buffer is too small.
+#[inline]
+pub fn parse_counted_binary_sized(
+    data: &[u8],
+    start_offset: usize,
+    size_bytes: usize,
+) -> Result<&[u8]> {
+    if start_offset.saturating_add(size_bytes) > data.len() {
+        return Err(Error::parse("insufficient data for counted binary"));
+    }
+
+    let content_start = start_offset + 2;
+    let content_len = size_bytes.saturating_sub(2);
+
+    Ok(&data[content_start..content_start + content_len])
+}
+
+/// Parse a counted array of fixed-size elements.
+///
+/// Returns a `Vec<T>` by reading `count` elements of `element_size` bytes each
+/// starting at `offset`.
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if the buffer is too small.
+#[inline]
+pub fn parse_array<T: FromBytes>(
+    data: &[u8],
+    offset: usize,
+    count: usize,
+    element_size: usize,
+) -> Result<Vec<T>> {
+    let total = count.saturating_mul(element_size);
+    if offset.saturating_add(total) > data.len() {
+        return Err(Error::parse("insufficient data for array"));
+    }
+
+    let mut result = Vec::with_capacity(count);
+    for i in 0..count {
+        let start = offset + i * element_size;
+        result.push(T::from_bytes(&data[start..start + element_size]));
+    }
+    Ok(result)
+}
+
+/// Parse a binary field with a length specified by a previous field.
+///
+/// This handles the `PropertyParamLength` case where a preceding field
+/// (usually `u32` or `u16`) specifies the length of binary data that follows.
+///
+/// # Errors
+///
+/// Returns [`Error::ParseError`] if the buffer is too small.
+///
+/// # Example
+///
+/// ```no_run
+/// # fn example(user_data: &[u8]) -> etw::Result<()> {
+/// use etw::static_schema::{parse_binary, parse_fixed};
+/// let data_length: u32 = parse_fixed(user_data, 0, 4)?;
+/// let payload: &[u8] = parse_binary(user_data, 4, data_length as usize)?;
+/// # Ok(())
+/// # }
+/// ```
+#[inline]
+pub fn parse_binary(data: &[u8], offset: usize, length: usize) -> Result<&[u8]> {
+    if offset.saturating_add(length) > data.len() {
+        return Err(Error::parse("insufficient data for binary field"));
+    }
+
+    Ok(&data[offset..offset + length])
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Type Conversion Trait
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Trait for types that can be parsed from raw bytes at compile-time known offsets.
+///
+/// This trait is similar to [`FromProperty`](crate::parser::FromProperty) but optimised
+/// for zero-cost fixed-offset access where the size and offset are compile-time constants.
+pub trait FromBytes: Sized {
+    /// Convert raw bytes to this type.
+    ///
+    /// The caller must ensure the slice has the correct length for this type.
+    fn from_bytes(bytes: &[u8]) -> Self;
+}
+
+// Implement for all primitive integer types.
+// Callers (parse_fixed, parse_array) validate `bytes.len() >= SIZE` before calling,
+// so `try_into().unwrap()` is infallible in practice. Using `unwrap()` instead of
+// `unwrap_or([0; SIZE])` removes the dead zero-init fallback branch.
+macro_rules! impl_from_bytes_int {
+    ($($t:ty),*) => {
+        $(
+            impl FromBytes for $t {
+                // Length pre-validated by caller.
+                #[inline]
+                fn from_bytes(bytes: &[u8]) -> Self {
+                    const SIZE: usize = size_of::<$t>();
+                    debug_assert!(bytes.len() >= SIZE);
+                    Self::from_le_bytes(bytes[..SIZE].try_into().unwrap())
+                }
+            }
+        )*
+    };
+}
+
+// usize/isize are intentionally excluded — they must go through parse_pointer /
+// parse_signed_pointer which handles the event's pointer size.  Using FromBytes
+// for usize would read size_of::<usize>() bytes (host pointer size), which is
+// wrong for 32-bit events on a 64-bit host.
+impl_from_bytes_int!(u8, u16, u32, u64, i8, i16, i32, i64);
+
+impl FromBytes for bool {
+    #[inline]
+    fn from_bytes(bytes: &[u8]) -> Self {
+        // ETW booleans may be 4-byte Win32 BOOL or 1-byte BOOLEAN.
+        debug_assert!(!bytes.is_empty());
+        if bytes.len() >= 4 {
+            u32::from_bytes(bytes) != 0
+        } else {
+            bytes[0] != 0
+        }
+    }
+}
+
+impl FromBytes for f32 {
+    #[inline]
+    #[expect(clippy::unwrap_used, reason = "length pre-validated by caller")]
+    fn from_bytes(bytes: &[u8]) -> Self {
+        debug_assert!(bytes.len() >= 4);
+        Self::from_le_bytes(bytes[..4].try_into().unwrap())
+    }
+}
+
+impl FromBytes for f64 {
+    #[inline]
+    #[expect(clippy::unwrap_used, reason = "length pre-validated by caller")]
+    fn from_bytes(bytes: &[u8]) -> Self {
+        debug_assert!(bytes.len() >= 8);
+        Self::from_le_bytes(bytes[..8].try_into().unwrap())
+    }
+}
+
+impl FromBytes for Guid {
+    #[inline]
+    fn from_bytes(bytes: &[u8]) -> Self {
+        debug_assert!(bytes.len() >= 16);
+        // Build from bounds-checked indexing (like SystemTime below) rather than an
+        // unaligned raw read: a short slice now panics safely instead of reading past
+        // the buffer (the previous `debug_assert!` was compiled out in release, leaving
+        // the raw read unguarded). `from_values` reproduces the Windows GUID layout
+        // (Data1/Data2/Data3 little-endian, Data4 raw bytes) on every target, matching
+        // FromProperty for windows_sys::core::GUID.
+        Self::from_values(
+            u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            u16::from_le_bytes([bytes[4], bytes[5]]),
+            u16::from_le_bytes([bytes[6], bytes[7]]),
+            [
+                bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
+                bytes[15],
+            ],
+        )
+    }
+}
+
+impl FromBytes for SystemTime {
+    #[inline]
+    fn from_bytes(bytes: &[u8]) -> Self {
+        // SystemTime is 8 u16 fields (16 bytes total).
+        debug_assert!(bytes.len() >= 16);
+        Self {
+            year: u16::from_le_bytes([bytes[0], bytes[1]]),
+            month: u16::from_le_bytes([bytes[2], bytes[3]]),
+            day_of_week: u16::from_le_bytes([bytes[4], bytes[5]]),
+            day: u16::from_le_bytes([bytes[6], bytes[7]]),
+            hour: u16::from_le_bytes([bytes[8], bytes[9]]),
+            minute: u16::from_le_bytes([bytes[10], bytes[11]]),
+            second: u16::from_le_bytes([bytes[12], bytes[13]]),
+            milliseconds: u16::from_le_bytes([bytes[14], bytes[15]]),
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Schema Validation Helpers
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Checks whether two TDH type names refer to compatible Rust types.
+///
+/// Multiple TDH InTypes map to the same Rust type (e.g., `UInt64`, `FileTime`, and
+/// `HexInt64` all map to `u64`). This function returns `true` when the expected and
+/// actual TDH names are interchangeable at the Rust level.
+///
+/// Used by schema validation tests generated by the `event_schema!` macro.
+#[doc(hidden)]
+pub const fn tdh_types_compatible(expected: &str, actual: &str) -> bool {
+    // Groups of TDH types that map to the same Rust type
+    const fn is_u64_group(name: &str) -> bool {
+        matches_str(name, "UInt64")
+            || matches_str(name, "FileTime")
+            || matches_str(name, "HexInt64")
+    }
+
+    const fn is_u32_group(name: &str) -> bool {
+        matches_str(name, "UInt32") || matches_str(name, "HexInt32")
+    }
+
+    const fn is_usize_group(name: &str) -> bool {
+        matches_str(name, "Pointer") || matches_str(name, "SizeT")
+    }
+
+    // UnicodeChar (InType 306) maps to u16 when length ≤ 2
+    const fn is_u16_group(name: &str) -> bool {
+        matches_str(name, "UInt16") || matches_str(name, "UnicodeChar")
+    }
+
+    // All single-byte TDH types are interchangeable at the Rust level:
+    // UInt8 (4), Int8 (3), AnsiChar (307)
+    const fn is_u8_group(name: &str) -> bool {
+        matches_str(name, "UInt8") || matches_str(name, "Int8") || matches_str(name, "AnsiChar")
+    }
+
+    // ManifestCountedString (22) and UnicodeString (1) both produce WideStrRef
+    const fn is_wide_string_group(name: &str) -> bool {
+        matches_str(name, "UnicodeString") || matches_str(name, "ManifestCountedString")
+    }
+
+    // ManifestCountedAnsiString (23) and AnsiString (2) both produce AnsiStrRef
+    const fn is_ansi_string_group(name: &str) -> bool {
+        matches_str(name, "AnsiString") || matches_str(name, "ManifestCountedAnsiString")
+    }
+
+    // ManifestCountedBinary (25) and Binary (14) both produce &[u8]
+    const fn is_binary_group(name: &str) -> bool {
+        matches_str(name, "Binary") || matches_str(name, "ManifestCountedBinary")
+    }
+
+    // Check if both belong to the same compatibility group
+    (is_u64_group(expected) && is_u64_group(actual))
+        || (is_u32_group(expected) && is_u32_group(actual))
+        || (is_usize_group(expected) && is_usize_group(actual))
+        || (is_u16_group(expected) && is_u16_group(actual))
+        || (is_u8_group(expected) && is_u8_group(actual))
+        || (is_wide_string_group(expected) && is_wide_string_group(actual))
+        || (is_ansi_string_group(expected) && is_ansi_string_group(actual))
+        || (is_binary_group(expected) && is_binary_group(actual))
+}
+
+/// Const-compatible string equality (since `==` on `&str` isn't const-stable).
+const fn matches_str(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Runtime Schema Validation (TDH)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Field descriptor for runtime schema validation against TDH.
+///
+/// Used by [`validate_schema()`] — invoked indirectly via
+/// [`validate_all_schemas()`](crate::validate_all_schemas) — to describe each
+/// field's expected name and TDH InType.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct StaticFieldInfo {
+    /// Field name as declared in the static schema.
+    pub name: &'static str,
+    /// Expected TDH InType name (e.g., "UInt32", "UnicodeString").
+    /// `None` for fields that don't have a direct TDH mapping (e.g., struct arrays).
+    pub expected_tdh_type: Option<&'static str>,
+    /// TDH property flags the field's declared layout requires TDH to report:
+    /// `PropertyStruct` (0x1), `PropertyParamLength` (0x2),
+    /// `PropertyParamCount` (0x4). Zero when the layout implies none.
+    pub required_property_flags: u32,
+}
+
+/// Version descriptor for runtime schema validation against TDH.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct StaticVersionInfo {
+    /// Event version number.
+    pub version: u8,
+    /// Fields in this version (after extends resolution).
+    pub fields: &'static [StaticFieldInfo],
+    /// When `true`, the schema is a valid prefix — trailing unsupported fields
+    /// were stripped, so field count uses `>=` instead of `==`.
+    pub truncated: bool,
+}
+
+/// Validate a static schema against the Windows TDH registry.
+///
+/// For each known version, queries TDH and compares field count, names, and types.
+/// For version N+1 (one above the maximum known), checks that index hints from
+/// the latest version still map to the correct field names.
+///
+/// # Errors
+///
+/// Returns an error if the schema doesn't match TDH for any known version, or
+/// (in debug builds) if a new unknown version exists with shifted field positions.
+///
+/// Returns `Ok(())` if the provider is not registered on this machine
+/// (`ERROR_NOT_FOUND` / 1168).
+#[doc(hidden)]
+pub fn validate_schema(
+    provider_guid: &Guid,
+    event_id: u16,
+    opcode: u8,
+    is_classic: bool,
+    versions: &[StaticVersionInfo],
+    // For N+1 canary: (field_name, expected_index) pairs from the latest version
+    next_version_hints: &[(&str, u32)],
+) -> crate::Result<()> {
+    // The `windows` GUID stays internal — see `types::Guid`.
+    let provider_guid = provider_guid.as_sys();
+    // Validate each known version
+    for ver_info in versions {
+        validate_single_version(
+            provider_guid,
+            event_id,
+            opcode,
+            is_classic,
+            ver_info.version,
+            ver_info.fields,
+            ver_info.truncated,
+        )?;
+    }
+
+    // N+1 canary: check that the next version (if it exists) hasn't shifted
+    // field positions relative to our latest known version.
+    if let Some(last) = versions.last() {
+        let canary_version = last.version.wrapping_add(1);
+        if canary_version > last.version {
+            validate_next_version_hints(
+                provider_guid,
+                event_id,
+                opcode,
+                is_classic,
+                canary_version,
+                next_version_hints,
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Query TDH for a specific (provider, event_id, version) tuple.
+///
+/// Returns `Ok(None)` if `ERROR_NOT_FOUND` (provider not registered).
+/// Returns the raw TRACE_EVENT_INFO buffer on success.
+fn query_tdh(
+    provider_guid: &windows_sys::core::GUID,
+    event_id: u16,
+    opcode: u8,
+    is_classic: bool,
+    version: u8,
+) -> crate::Result<Option<Vec<u8>>> {
+    use windows_sys::Win32::{
+        Foundation::ERROR_INSUFFICIENT_BUFFER,
+        System::Diagnostics::Etw::{
+            EVENT_DESCRIPTOR, EVENT_HEADER, EVENT_HEADER_FLAG_32_BIT_HEADER,
+            EVENT_HEADER_FLAG_64_BIT_HEADER, EVENT_HEADER_FLAG_CLASSIC_HEADER, EVENT_RECORD,
+            TRACE_EVENT_INFO, TdhGetEventInformation,
+        },
+    };
+
+    // SAFETY: zeroed EVENT_HEADER/EVENT_RECORD is valid for TDH queries —
+    // TDH only reads the header fields we set below.
+    let mut event_header: EVENT_HEADER = unsafe { std::mem::zeroed() };
+    let mut flags = if cfg!(target_pointer_width = "64") {
+        EVENT_HEADER_FLAG_64_BIT_HEADER as u16
+    } else {
+        EVENT_HEADER_FLAG_32_BIT_HEADER as u16
+    };
+    if is_classic {
+        flags |= EVENT_HEADER_FLAG_CLASSIC_HEADER as u16;
+    }
+    event_header.Flags = flags;
+    event_header.ProviderId = *provider_guid;
+    event_header.EventDescriptor = EVENT_DESCRIPTOR {
+        Id: event_id,
+        Version: version,
+        Channel: 0,
+        Level: 0,
+        Opcode: opcode,
+        Task: 0,
+        Keyword: 0,
+    };
+
+    let event_record = EVENT_RECORD {
+        EventHeader: event_header,
+        // SAFETY: zeroed is valid for fields we don't use.
+        BufferContext: unsafe { std::mem::zeroed() },
+        ExtendedDataCount: 0,
+        UserDataLength: 0,
+        ExtendedData: std::ptr::null_mut(),
+        UserData: std::ptr::null_mut(),
+        UserContext: std::ptr::null_mut(),
+    };
+
+    let mut buffer_size = 0u32;
+    // SAFETY: event_record is stack-allocated and valid for the duration of the call.
+    let status = unsafe {
+        TdhGetEventInformation(
+            &raw const event_record,
+            0,
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            &raw mut buffer_size,
+        )
+    };
+
+    if status == windows_sys::Win32::Foundation::ERROR_NOT_FOUND {
+        // ERROR_NOT_FOUND — provider not registered on this machine.
+        return Ok(None);
+    }
+    if status != ERROR_INSUFFICIENT_BUFFER {
+        return Err(crate::Error::SchemaValidationError {
+            context: crate::processing_context::EventContext::new(
+                crate::Guid::from_sys(*provider_guid),
+                event_id,
+                opcode,
+                version,
+            ),
+            mismatch: Box::new(crate::SchemaMismatch::TdhSizingFailed { status }),
+        });
+    }
+
+    let mut buffer = vec![0u8; buffer_size as usize];
+    let trace_event_info = buffer.as_mut_ptr().cast::<TRACE_EVENT_INFO>();
+
+    // SAFETY: buffer is correctly sized from the previous call, and
+    // trace_event_info points to the start of it.
+    let status = unsafe {
+        TdhGetEventInformation(
+            &raw const event_record,
+            0,
+            std::ptr::null(),
+            trace_event_info,
+            &raw mut buffer_size,
+        )
+    };
+
+    if status != windows_sys::Win32::Foundation::ERROR_SUCCESS {
+        return Err(crate::Error::SchemaValidationError {
+            context: crate::processing_context::EventContext::new(
+                crate::Guid::from_sys(*provider_guid),
+                event_id,
+                opcode,
+                version,
+            ),
+            mismatch: Box::new(crate::SchemaMismatch::TdhRetrievalFailed { status }),
+        });
+    }
+
+    Ok(Some(buffer))
+}
+
+/// Read the property name at a given index from a TRACE_EVENT_INFO buffer.
+///
+/// `index` must be less than `schema.TopLevelPropertyCount`; passing an
+/// out-of-bounds index is undefined behaviour.
+fn property_name_at(buffer: &[u8], index: usize) -> String {
+    use windows_sys::Win32::System::Diagnostics::Etw::TRACE_EVENT_INFO;
+
+    // SAFETY: buffer was returned by TdhGetEventInformation and is correctly sized.
+    let schema = unsafe { &*(buffer.as_ptr().cast::<TRACE_EVENT_INFO>()) };
+    debug_assert!(
+        index < schema.TopLevelPropertyCount as usize,
+        "property_name_at: index {index} >= TopLevelPropertyCount {}",
+        schema.TopLevelPropertyCount
+    );
+    let properties_ptr = schema.EventPropertyInfoArray.as_ptr();
+    // SAFETY: index < TopLevelPropertyCount (debug_assert above); TDH allocates the
+    // EventPropertyInfoArray with exactly TopLevelPropertyCount entries.
+    let prop = unsafe { &*properties_ptr.add(index) };
+
+    let name_offset = prop.NameOffset as usize;
+    // SAFETY: TDH guarantees NameOffset points to a null-terminated UTF-16
+    // string within the buffer.
+    let name_ptr = unsafe { buffer.as_ptr().add(name_offset).cast::<u16>() };
+    let mut name_len = 0;
+    let max_len = (buffer.len().saturating_sub(name_offset)) / 2;
+    // SAFETY: name_ptr is within the TDH buffer. max_len bounds the scan to
+    // the remaining bytes in the buffer, preventing reads past the allocation.
+    unsafe {
+        while name_len < max_len && *name_ptr.add(name_len) != 0 {
+            name_len += 1;
+        }
+    }
+    // SAFETY: name_ptr..name_ptr+name_len is within the TDH buffer and
+    // contains valid UTF-16 data (TDH guarantees null-terminated string).
+    let name_slice = unsafe { std::slice::from_raw_parts(name_ptr, name_len) };
+    let actual_name = String::from_utf16_lossy(name_slice);
+
+    // Sanitise the TDH name the same way the generator does
+    // (e.g., "Container ID" -> "Container_ID").
+    actual_name
+        .chars()
+        .enumerate()
+        .filter_map(|(i, c)| {
+            if c.is_alphanumeric() || c == '_' {
+                Some(c)
+            } else if i > 0 {
+                Some('_')
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Validate a single version's fields against TDH.
+fn validate_single_version(
+    provider_guid: &windows_sys::core::GUID,
+    event_id: u16,
+    opcode: u8,
+    is_classic: bool,
+    version: u8,
+    fields: &[StaticFieldInfo],
+    truncated: bool,
+) -> crate::Result<()> {
+    let Some(buffer) = query_tdh(provider_guid, event_id, opcode, is_classic, version)? else {
+        // Provider not registered — skip.
+        return Ok(());
+    };
+
+    use windows_sys::Win32::System::Diagnostics::Etw::TRACE_EVENT_INFO;
+
+    // SAFETY: buffer was returned by TdhGetEventInformation.
+    let schema = unsafe { &*(buffer.as_ptr().cast::<TRACE_EVENT_INFO>()) };
+    let property_count = schema.TopLevelPropertyCount as usize;
+    // Identity is carried as data, so the provider name no longer has to be
+    // pulled out of the TDH buffer on every validation just to build a message.
+    let context = crate::processing_context::EventContext::new(
+        crate::Guid::from_sys(*provider_guid),
+        event_id,
+        opcode,
+        version,
+    );
+
+    // Validate field count.
+    if truncated {
+        if property_count < fields.len() {
+            return Err(crate::Error::SchemaValidationError {
+                context,
+                mismatch: Box::new(crate::SchemaMismatch::TooFewFields {
+                    expected: fields.len(),
+                    actual: property_count,
+                }),
+            });
+        }
+    } else if property_count != fields.len() {
+        return Err(crate::Error::SchemaValidationError {
+            context,
+            mismatch: Box::new(crate::SchemaMismatch::FieldCount {
+                expected: fields.len(),
+                actual: property_count,
+            }),
+        });
+    }
+
+    // Validate each field.
+    let properties_ptr = schema.EventPropertyInfoArray.as_ptr();
+    for (idx, field_info) in fields.iter().enumerate() {
+        let actual_name = property_name_at(&buffer, idx);
+        if actual_name != field_info.name {
+            return Err(crate::Error::SchemaValidationError {
+                context,
+                mismatch: Box::new(crate::SchemaMismatch::FieldName {
+                    index: idx,
+                    expected: field_info.name,
+                    actual: actual_name,
+                }),
+            });
+        }
+
+        // SAFETY: index is within TopLevelPropertyCount bounds.
+        let prop = unsafe { &*properties_ptr.add(idx) };
+        let flags = prop.Flags as u32;
+
+        // Flags check: counted arrays, length-prefixed fields, and struct
+        // arrays each require specific TDH property flags to be present.
+        let required = field_info.required_property_flags;
+        if required != 0 && (flags & required) != required {
+            return Err(crate::Error::SchemaValidationError {
+                context,
+                mismatch: Box::new(crate::SchemaMismatch::FieldFlags {
+                    index: idx,
+                    field: field_info.name,
+                    required,
+                    actual: flags,
+                }),
+            });
+        }
+
+        // Type check (skip for fields without a TDH mapping, e.g., struct arrays).
+        if let Some(expected_type) = field_info.expected_tdh_type {
+            // Struct properties have PropertyStruct flag (0x1) — InType is
+            // repurposed as StructStartIndex, so skip type comparison.
+            if (flags & 0x1) == 0 {
+                // SAFETY: non-struct property — nonStructType is the active union variant.
+                let in_type = unsafe { prop.Anonymous1.nonStructType.InType };
+                let in_type_name = crate::processing_context::in_type_name(in_type);
+
+                let type_matches = in_type_name.eq_ignore_ascii_case(expected_type)
+                    || tdh_types_compatible(expected_type, in_type_name);
+
+                if !type_matches {
+                    return Err(crate::Error::SchemaValidationError {
+                        context,
+                        mismatch: Box::new(crate::SchemaMismatch::FieldType {
+                            index: idx,
+                            field: field_info.name,
+                            expected: expected_type,
+                            actual: in_type_name,
+                        }),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate N+1 canary: check that index hints from the latest known version
+/// still map to the correct field names in the next version.
+fn validate_next_version_hints(
+    provider_guid: &windows_sys::core::GUID,
+    event_id: u16,
+    opcode: u8,
+    is_classic: bool,
+    canary_version: u8,
+    hints: &[(&str, u32)],
+) -> crate::Result<()> {
+    let Some(buffer) = query_tdh(provider_guid, event_id, opcode, is_classic, canary_version)?
+    else {
+        // Version doesn't exist yet — nothing to validate.
+        return Ok(());
+    };
+
+    use windows_sys::Win32::System::Diagnostics::Etw::TRACE_EVENT_INFO;
+
+    // SAFETY: buffer was returned by TdhGetEventInformation.
+    let schema = unsafe { &*(buffer.as_ptr().cast::<TRACE_EVENT_INFO>()) };
+    let property_count = schema.TopLevelPropertyCount as usize;
+    let context = crate::processing_context::EventContext::new(
+        crate::Guid::from_sys(*provider_guid),
+        event_id,
+        opcode,
+        canary_version,
+    );
+
+    for &(expected_name, expected_index) in hints {
+        let idx = expected_index as usize;
+        if idx >= property_count {
+            let err = crate::Error::SchemaValidationError {
+                context,
+                mismatch: Box::new(crate::SchemaMismatch::CanaryHintOutOfBounds {
+                    index: idx,
+                    field: expected_name.to_owned(),
+                    property_count,
+                }),
+            };
+            #[cfg(debug_assertions)]
+            {
+                return Err(err);
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                // info not warn: this is a performance degradation (hint miss → O(1) hash
+                // lookup instead of direct index), not a correctness failure. Debug builds
+                // already panic above.
+                log::info!("{err}");
+                return Ok(());
+            }
+        }
+
+        let actual_name = property_name_at(&buffer, idx);
+        if actual_name != expected_name {
+            let err = crate::Error::SchemaValidationError {
+                context,
+                mismatch: Box::new(crate::SchemaMismatch::CanaryHintStale {
+                    index: idx,
+                    expected: expected_name.to_owned(),
+                    actual: actual_name,
+                }),
+            };
+            #[cfg(debug_assertions)]
+            {
+                return Err(err);
+            }
+            #[cfg(not(debug_assertions))]
+            {
+                // info not warn: see comment above.
+                log::info!("{err}");
+                return Ok(());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tests
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    clippy::undocumented_unsafe_blocks,
+    reason = "test-only assertions"
+)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_fixed_u32() {
+        let data = [0x00, 0x00, 0x00, 0x00, 0x34, 0x12, 0x00, 0x00];
+
+        // Parse at offset 0
+        let value: u32 = parse_fixed(&data, 0, 4).expect("should parse");
+        assert_eq!(value, 0);
+
+        // Parse at offset 4
+        let value: u32 = parse_fixed(&data, 4, 4).expect("should parse");
+        assert_eq!(value, 0x1234);
+    }
+
+    #[test]
+    fn test_parse_fixed_insufficient_data() {
+        let data = [0x01, 0x02];
+
+        // Attempt to parse u32 at offset 0 (need 4 bytes, only have 2)
+        let result: Result<u32> = parse_fixed(&data, 0, 4);
+        assert!(result.is_err());
+
+        // Attempt to parse u32 at offset 2 (completely beyond buffer)
+        let result: Result<u32> = parse_fixed(&data, 2, 4);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_following_string_with_null() {
+        // "Test" in UTF-16 LE with null terminator
+        let data = [
+            0x54, 0x00, // 'T'
+            0x65, 0x00, // 'e'
+            0x73, 0x00, // 's'
+            0x74, 0x00, // 't'
+            0x00, 0x00, // null terminator
+        ];
+
+        let result = parse_following_string(&data, 0).expect("should parse");
+        assert_eq!(result.len(), 4); // 4 code units (8 bytes)
+    }
+
+    #[test]
+    fn test_parse_following_string_no_null() {
+        // "Hi" in UTF-16 LE without null terminator
+        let data = [
+            0x48, 0x00, // 'H'
+            0x69, 0x00, // 'i'
+        ];
+
+        let result = parse_following_string(&data, 0).expect("should parse");
+        assert_eq!(result.len(), 2); // 2 code units (4 bytes)
+    }
+
+    #[test]
+    fn test_parse_following_string_offset() {
+        // Some fixed data followed by "Hi" in UTF-16 LE
+        let data = [
+            0xFF, 0xFF, 0xFF, 0xFF, // Fixed field
+            0x48, 0x00, // 'H'
+            0x69, 0x00, // 'i'
+            0x00, 0x00, // null
+        ];
+
+        let result = parse_following_string(&data, 4).expect("should parse");
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_following_ansi_string() {
+        let data = b"Hello\0World";
+
+        let result = parse_following_ansi_string(data, 0).expect("should parse");
+        assert_eq!(result.as_bytes(), b"Hello");
+
+        // Start from after the null
+        let result = parse_following_ansi_string(data, 6).expect("should parse");
+        assert_eq!(result.as_bytes(), b"World");
+    }
+
+    #[test]
+    fn test_parse_binary() {
+        let data = [0x00, 0x00, 0x00, 0x00, 0xAA, 0xBB, 0xCC, 0xDD];
+
+        // Parse 4 bytes at offset 4
+        let result = parse_binary(&data, 4, 4).expect("should parse");
+        assert_eq!(result, &[0xAA, 0xBB, 0xCC, 0xDD]);
+
+        // Parse 2 bytes at offset 0
+        let result = parse_binary(&data, 0, 2).expect("should parse");
+        assert_eq!(result, &[0x00, 0x00]);
+    }
+
+    #[test]
+    fn test_from_bytes_primitives() {
+        assert_eq!(u32::from_bytes(&[0x34, 0x12, 0x00, 0x00]), 0x1234);
+        assert_eq!(u16::from_bytes(&[0x34, 0x12]), 0x1234);
+        assert_eq!(u8::from_bytes(&[0x42]), 0x42);
+
+        assert_eq!(i32::from_bytes(&[0xFF, 0xFF, 0xFF, 0xFF]), -1);
+
+        assert!(bool::from_bytes(&[0x01, 0x00, 0x00, 0x00]));
+        assert!(!bool::from_bytes(&[0x00, 0x00, 0x00, 0x00]));
+    }
+
+    #[test]
+    fn test_from_bytes_float() {
+        let bytes = std::f32::consts::PI.to_le_bytes();
+        let value = f32::from_bytes(&bytes);
+        assert!((value - std::f32::consts::PI).abs() < 0.01);
+    }
+
+    // ========================================================================
+    // Last-property NULL terminator handling
+    // ========================================================================
+
+    #[test]
+    fn test_parse_wide_string_sized_with_null() {
+        // "Hi" in UTF-16 LE with null terminator
+        let data = [
+            0x48, 0x00, // 'H'
+            0x69, 0x00, // 'i'
+            0x00, 0x00, // null
+        ];
+        let result = parse_wide_string_sized(&data, 0, 6).expect("should parse");
+        assert_eq!(result.len(), 2); // 2 code units: 'H', 'i'
+    }
+
+    #[test]
+    fn test_parse_wide_string_sized_without_null() {
+        // "Hi" in UTF-16 LE WITHOUT null terminator (ETW dropped it)
+        let data = [
+            0x48, 0x00, // 'H'
+            0x69, 0x00, // 'i'
+        ];
+        let result = parse_wide_string_sized(&data, 0, 4).expect("should parse");
+        assert_eq!(result.len(), 2); // Must still get both code units
+    }
+
+    #[test]
+    fn test_parse_ansi_string_sized_with_null() {
+        let data = b"Hi\0";
+        let result = parse_ansi_string_sized(data, 0, 3).expect("should parse");
+        assert_eq!(result.as_bytes(), b"Hi");
+    }
+
+    #[test]
+    fn test_parse_ansi_string_sized_without_null() {
+        // "Hi" WITHOUT null terminator (ETW dropped it)
+        let data = b"Hi";
+        let result = parse_ansi_string_sized(data, 0, 2).expect("should parse");
+        assert_eq!(result.as_bytes(), b"Hi"); // Must still get both chars
+    }
+
+    #[test]
+    fn test_parse_wide_string_sized_at_offset_without_null() {
+        // Fixed prefix + "AB" in UTF-16 LE without null
+        let data = [
+            0xFF, 0xFF, 0xFF, 0xFF, // 4 bytes of fixed data
+            0x41, 0x00, // 'A'
+            0x42, 0x00, // 'B'
+        ];
+        let result = parse_wide_string_sized(&data, 4, 4).expect("should parse");
+        assert_eq!(result.len(), 2); // 2 code units: 'A', 'B'
+    }
+
+    // ========================================================================
+    // pointer_size_from_event tests
+    // ========================================================================
+
+    #[test]
+    fn test_pointer_size_from_event_64bit() {
+        use windows_sys::Win32::System::Diagnostics::Etw::EVENT_RECORD;
+        // SAFETY: EVENT_RECORD is a POD type; zero-init is valid.
+        let record: EVENT_RECORD = unsafe { std::mem::zeroed() };
+        let event = unsafe { crate::event::RawEvent::from_ptr(&raw const record) };
+        assert_eq!(pointer_size_from_event(event), 8);
+    }
+
+    #[test]
+    fn test_pointer_size_from_event_32bit() {
+        use windows_sys::Win32::System::Diagnostics::Etw::EVENT_RECORD;
+        // SAFETY: EVENT_RECORD is a POD type; zero-init is valid.
+        let mut record: EVENT_RECORD = unsafe { std::mem::zeroed() };
+        record.EventHeader.Flags = 0x20; // EVENT_HEADER_FLAG_32_BIT_HEADER
+        let event = unsafe { crate::event::RawEvent::from_ptr(&raw const record) };
+        assert_eq!(pointer_size_from_event(event), 4);
+    }
+
+    // ========================================================================
+    // scan_past_wide_string / scan_past_ansi_string tests
+    // ========================================================================
+
+    #[test]
+    fn test_scan_past_wide_string_finds_null() {
+        let data = [
+            0x48u8, 0x00, // 'H'
+            0x69, 0x00, // 'i'
+            0x00, 0x00, // null terminator
+            0xFF, 0xFF, // trailing data
+        ];
+        assert_eq!(scan_past_wide_string(&data, 0).expect("should succeed"), 6);
+    }
+
+    #[test]
+    fn test_scan_past_wide_string_no_null_returns_end() {
+        let data = [0x41u8, 0x00, 0x42, 0x00]; // "AB", no null
+        assert_eq!(scan_past_wide_string(&data, 0).expect("should succeed"), 4);
+    }
+
+    #[test]
+    fn test_scan_past_wide_string_offset_beyond_buffer_errors() {
+        let data = [0u8; 4];
+        assert!(scan_past_wide_string(&data, 4).is_err());
+    }
+
+    #[test]
+    fn test_scan_past_ansi_string_finds_null() {
+        let data = b"Hello\0rest";
+        assert_eq!(scan_past_ansi_string(data, 0).expect("should succeed"), 6);
+    }
+
+    #[test]
+    fn test_scan_past_ansi_string_no_null_returns_end() {
+        let data = b"Hello";
+        assert_eq!(scan_past_ansi_string(data, 0).expect("should succeed"), 5);
+    }
+
+    #[test]
+    fn test_scan_past_ansi_string_offset_beyond_buffer_errors() {
+        let data = b"Hi";
+        assert!(scan_past_ansi_string(data, 2).is_err());
+    }
+
+    // ========================================================================
+    // SID parsing tests
+    // ========================================================================
+
+    // S-1-5-18 (LocalSystem): revision=1, subauth_count=1, authority=5, subauth[0]=18
+    fn local_system_sid_bytes() -> [u8; 12] {
+        [
+            0x01, // Revision = 1
+            0x01, // SubAuthorityCount = 1
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // IdentifierAuthority = 5
+            0x12, 0x00, 0x00, 0x00, // SubAuthority[0] = 18
+        ]
+    }
+
+    #[test]
+    fn test_parse_following_sid_valid() {
+        let data = local_system_sid_bytes();
+        let sid = parse_following_sid(&data, 0).expect("should parse");
+        assert_eq!(sid.revision(), 1);
+        assert_eq!(sid.sub_authority_count(), 1);
+    }
+
+    #[test]
+    fn test_parse_following_sid_insufficient_data() {
+        let short = [0x01u8, 0x01]; // only 2 bytes, need at least 8 for header
+        assert!(parse_following_sid(&short, 0).is_err());
+    }
+
+    #[test]
+    fn test_parse_sid_sized_valid() {
+        let data = local_system_sid_bytes();
+        let sid = parse_sid_sized(&data, 0, 12).expect("should parse");
+        assert_eq!(sid.revision(), 1);
+        assert_eq!(sid.sub_authority_count(), 1);
+    }
+
+    #[test]
+    fn test_parse_sid_sized_insufficient_data() {
+        let data = local_system_sid_bytes();
+        assert!(parse_sid_sized(&data, 0, 100).is_err());
+    }
+
+    #[test]
+    fn test_parse_wbem_sid_valid() {
+        let mut data = vec![0u8; 16]; // TOKEN_USER header (16 bytes)
+        data.extend_from_slice(&local_system_sid_bytes());
+        let sid = parse_wbem_sid(&data, 0).expect("should parse");
+        assert_eq!(sid.revision(), 1);
+        assert_eq!(sid.sub_authority_count(), 1);
+    }
+
+    #[test]
+    fn test_parse_wbem_sid_too_short() {
+        let data = [0u8; 15]; // shorter than TOKEN_USER header (16 bytes)
+        assert!(parse_wbem_sid(&data, 0).is_err());
+    }
+
+    #[test]
+    fn test_parse_wbem_sid_sized_valid() {
+        let mut data = vec![0u8; 16]; // TOKEN_USER header
+        data.extend_from_slice(&local_system_sid_bytes());
+        let total = data.len();
+        let sid = parse_wbem_sid_sized(&data, 0, total).expect("should parse");
+        assert_eq!(sid.revision(), 1);
+    }
+
+    #[test]
+    fn test_parse_wbem_sid_sized_size_too_small() {
+        let mut data = vec![0u8; 16];
+        data.extend_from_slice(&local_system_sid_bytes());
+        // size_bytes < WBEM_SID_TOKEN_USER_SIZE (16)
+        assert!(parse_wbem_sid_sized(&data, 0, 8).is_err());
+    }
+
+    // ========================================================================
+    // parse_array tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_array_u32() {
+        let data: Vec<u8> = [1u32, 2, 3].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let result: Vec<u32> = parse_array(&data, 0, 3, 4).expect("should parse");
+        assert_eq!(result, [1u32, 2, 3]);
+    }
+
+    #[test]
+    fn test_parse_array_insufficient_data() {
+        let data = [0u8; 8]; // only 8 bytes, but requesting 3 × u32 = 12 bytes
+        let result: Result<Vec<u32>> = parse_array(&data, 0, 3, 4);
+        assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // parse_pointer / parse_signed_pointer tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_pointer_valid_4_and_8_byte() {
+        let data = [
+            0x34u8, 0x12, 0x00, 0x00, 0x78, 0x56, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        // 4-byte pointer at offset 0
+        let p4 = parse_pointer(&data, 0, 4).expect("4-byte pointer");
+        assert_eq!(p4, 0x1234);
+        // 8-byte pointer at offset 0
+        let p8 = parse_pointer(&data, 0, 8).expect("8-byte pointer");
+        assert_eq!(p8, 0x0000_5678_0000_1234);
+    }
+
+    #[test]
+    fn test_parse_pointer_invalid_size_returns_error() {
+        let data = [0u8; 8];
+        assert!(parse_pointer(&data, 0, 3).is_err());
+    }
+
+    #[test]
+    fn test_parse_pointer_insufficient_data_returns_error() {
+        let data = [0u8; 2];
+        assert!(parse_pointer(&data, 0, 4).is_err());
+    }
+
+    #[test]
+    fn test_parse_signed_pointer_valid_4_and_8_byte() {
+        // -1 as u32 LE
+        let data = [0xFFu8, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let s4 = parse_signed_pointer(&data, 0, 4).expect("4-byte signed");
+        assert_eq!(s4, -1isize);
+        let s8 = parse_signed_pointer(&data, 0, 8).expect("8-byte signed");
+        assert_eq!(s8, -1isize);
+    }
+
+    #[test]
+    fn test_parse_signed_pointer_invalid_size_returns_error() {
+        let data = [0u8; 8];
+        assert!(parse_signed_pointer(&data, 0, 3).is_err());
+    }
+
+    #[test]
+    fn test_parse_signed_pointer_insufficient_data_returns_error() {
+        let data = [0u8; 2];
+        assert!(parse_signed_pointer(&data, 0, 4).is_err());
+    }
+
+    // ========================================================================
+    // compute_wide_string_size / compute_ansi_string_size tests
+    // ========================================================================
+
+    #[test]
+    fn test_compute_wide_string_size_offset_beyond_buffer_errors() {
+        let data = [0u8; 4];
+        assert!(compute_wide_string_size(&data, 4).is_err());
+    }
+
+    #[test]
+    fn test_compute_wide_string_size_no_null_returns_aligned_len() {
+        // 5-byte buffer with no null u16 pair: offset 0, data is [0x41, 0x00, 0x42, 0x00, 0xFF]
+        // No null terminator found → remaining.len() & !1 = 4
+        let data = [0x41u8, 0x00, 0x42, 0x00, 0xFF];
+        let size = compute_wide_string_size(&data, 0).expect("should succeed");
+        assert_eq!(size, 4); // aligned down to 4
+    }
+
+    #[test]
+    fn test_compute_ansi_string_size_offset_beyond_buffer_errors() {
+        let data = [0u8; 2];
+        assert!(compute_ansi_string_size(&data, 2).is_err());
+    }
+
+    #[test]
+    fn test_compute_ansi_string_size_no_null_returns_remaining_len() {
+        let data = b"Hello"; // no null terminator
+        let size = compute_ansi_string_size(data, 0).expect("should succeed");
+        assert_eq!(size, 5);
+    }
+
+    // ========================================================================
+    // Error paths in parse_following_* and parse_*_sized
+    // ========================================================================
+
+    #[test]
+    fn test_parse_following_string_offset_beyond_buffer_errors() {
+        let data = [0x48u8, 0x00]; // "H"
+        assert!(parse_following_string(&data, 2).is_err());
+    }
+
+    #[test]
+    fn test_parse_wide_string_sized_insufficient_data_errors() {
+        let data = [0x48u8, 0x00, 0x69, 0x00]; // "Hi" (4 bytes)
+        // Requesting 8 bytes but only 4 available
+        assert!(parse_wide_string_sized(&data, 0, 8).is_err());
+    }
+
+    #[test]
+    fn test_parse_following_ansi_string_offset_beyond_buffer_errors() {
+        let data = b"Hi";
+        assert!(parse_following_ansi_string(data, 2).is_err());
+    }
+
+    #[test]
+    fn test_parse_ansi_string_sized_insufficient_data_errors() {
+        let data = b"Hi";
+        assert!(parse_ansi_string_sized(data, 0, 8).is_err());
+    }
+
+    // ========================================================================
+    // scan_past_sid / compute_sid_size error paths
+    // ========================================================================
+
+    #[test]
+    fn test_scan_past_sid_valid() {
+        let data = local_system_sid_bytes();
+        let next = scan_past_sid(&data, 0).expect("should succeed");
+        assert_eq!(next, 12); // S-1-5-18 is 12 bytes
+    }
+
+    #[test]
+    fn test_compute_sid_size_invalid_revision_errors() {
+        let mut data = local_system_sid_bytes();
+        data[0] = 2; // revision 2 is invalid
+        assert!(compute_sid_size(&data, 0).is_err());
+    }
+
+    #[test]
+    fn test_compute_sid_size_subauth_count_too_large_errors() {
+        let mut data = local_system_sid_bytes();
+        data[1] = 16; // SubAuthorityCount = 16 > 15
+        assert!(compute_sid_size(&data, 0).is_err());
+    }
+
+    #[test]
+    fn test_compute_sid_size_body_too_small_errors() {
+        // S-1-5 with SubAuthorityCount=2 but only 8 bytes (header only, no body)
+        let data = [0x01u8, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05];
+        // Needs 8 + 2*4 = 16 bytes but only 8 available
+        assert!(compute_sid_size(&data, 0).is_err());
+    }
+
+    // ========================================================================
+    // compute_wbem_sid_size
+    // ========================================================================
+
+    #[test]
+    fn test_compute_wbem_sid_size_valid() {
+        let mut data = vec![0u8; 16]; // TOKEN_USER header
+        data.extend_from_slice(&local_system_sid_bytes());
+        let size = compute_wbem_sid_size(&data, 0).expect("should succeed");
+        assert_eq!(size, 16 + 12); // header + S-1-5-18
+    }
+
+    // ========================================================================
+    // ManifestCounted field parsing
+    // ========================================================================
+
+    #[test]
+    fn test_compute_counted_size_valid() {
+        // 2-byte LE prefix = 4 (payload size), then 4 bytes of payload
+        let data = [0x04u8, 0x00, 0xAA, 0xBB, 0xCC, 0xDD];
+        let size = compute_counted_size(&data, 0).expect("should succeed");
+        assert_eq!(size, 6); // 2 (prefix) + 4 (payload)
+    }
+
+    #[test]
+    fn test_compute_counted_size_prefix_beyond_buffer_errors() {
+        let data = [0x01u8]; // only 1 byte, need 2 for prefix
+        assert!(compute_counted_size(&data, 0).is_err());
+    }
+
+    #[test]
+    fn test_compute_counted_size_payload_beyond_buffer_errors() {
+        // Prefix says 100 bytes but buffer only has 4 total
+        let data = [0x64u8, 0x00, 0xAA, 0xBB]; // 100 LE + 2 bytes
+        assert!(compute_counted_size(&data, 0).is_err());
+    }
+
+    #[test]
+    fn test_parse_counted_wide_string_sized_valid() {
+        // prefix=4, payload="Hi" (4 bytes)
+        let data = [0x04u8, 0x00, 0x48, 0x00, 0x69, 0x00];
+        let result = parse_counted_wide_string_sized(&data, 0, 6).expect("should parse");
+        assert_eq!(result.len(), 2); // 2 code units
+    }
+
+    #[test]
+    fn test_parse_counted_wide_string_sized_odd_payload_errors() {
+        // prefix=3, payload=3 bytes (odd → error)
+        let data = [0x03u8, 0x00, 0xAA, 0xBB, 0xCC];
+        assert!(parse_counted_wide_string_sized(&data, 0, 5).is_err());
+    }
+
+    #[test]
+    fn test_parse_counted_wide_string_sized_insufficient_data_errors() {
+        let data = [0x04u8, 0x00, 0xAA, 0xBB]; // size=6 but only 4 bytes
+        assert!(parse_counted_wide_string_sized(&data, 0, 6).is_err());
+    }
+
+    #[test]
+    fn test_parse_counted_ansi_string_sized_valid() {
+        let data = [0x05u8, 0x00, b'H', b'e', b'l', b'l', b'o'];
+        let result = parse_counted_ansi_string_sized(&data, 0, 7).expect("should parse");
+        assert_eq!(result.as_bytes(), b"Hello");
+    }
+
+    #[test]
+    fn test_parse_counted_ansi_string_sized_insufficient_data_errors() {
+        let data = [0x05u8, 0x00, b'H']; // size=7 but only 3 bytes
+        assert!(parse_counted_ansi_string_sized(&data, 0, 7).is_err());
+    }
+
+    #[test]
+    fn test_parse_counted_binary_sized_valid() {
+        let data = [0x02u8, 0x00, 0xAA, 0xBB];
+        let result = parse_counted_binary_sized(&data, 0, 4).expect("should parse");
+        assert_eq!(result, &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn test_parse_counted_binary_sized_insufficient_data_errors() {
+        let data = [0x02u8, 0x00]; // size=4 but only 2 bytes
+        assert!(parse_counted_binary_sized(&data, 0, 4).is_err());
+    }
+
+    // ========================================================================
+    // parse_binary error path
+    // ========================================================================
+
+    #[test]
+    fn test_parse_binary_insufficient_data_errors() {
+        let data = [0u8; 4];
+        assert!(parse_binary(&data, 0, 8).is_err());
+    }
+
+    // ========================================================================
+    // FromBytes implementations not yet covered
+    // ========================================================================
+
+    #[test]
+    fn test_from_bytes_f64() {
+        let val = std::f64::consts::E;
+        let bytes = val.to_le_bytes();
+        let result = f64::from_bytes(&bytes);
+        assert!((result - val).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_from_bytes_guid() {
+        // Use a known GUID: {12345678-1234-1234-1234-123456789012}
+        let g = windows_sys::core::GUID::from_u128(0x1234_5678_1234_1234_1234_1234_5678_9012);
+        let bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::from_ref(&g).cast::<u8>(),
+                size_of::<windows_sys::core::GUID>(),
+            )
+        };
+        let parsed = Guid::from_bytes(bytes);
+        assert_eq!(parsed, Guid::from_sys(g));
+    }
+
+    #[test]
+    fn test_from_bytes_system_time() {
+        // Encode 2024-01-15 10:30:00.500 manually as LE u16 fields
+        let mut bytes = [0u8; 16];
+        bytes[0..2].copy_from_slice(&2024u16.to_le_bytes()); // year
+        bytes[2..4].copy_from_slice(&1u16.to_le_bytes()); // month
+        bytes[4..6].copy_from_slice(&1u16.to_le_bytes()); // day_of_week (Monday)
+        bytes[6..8].copy_from_slice(&15u16.to_le_bytes()); // day
+        bytes[8..10].copy_from_slice(&10u16.to_le_bytes()); // hour
+        bytes[10..12].copy_from_slice(&30u16.to_le_bytes()); // minute
+        bytes[12..14].copy_from_slice(&0u16.to_le_bytes()); // second
+        bytes[14..16].copy_from_slice(&500u16.to_le_bytes()); // milliseconds
+        // Use the FromBytes trait explicitly to avoid shadowing by the inherent from_bytes(→
+        // Option)
+        let st = <crate::types::SystemTime as FromBytes>::from_bytes(&bytes);
+        assert_eq!(st.year, 2024);
+        assert_eq!(st.month, 1);
+        assert_eq!(st.day, 15);
+        assert_eq!(st.hour, 10);
+        assert_eq!(st.minute, 30);
+        assert_eq!(st.milliseconds, 500);
+    }
+
+    #[test]
+    fn test_from_bytes_bool_one_byte() {
+        // 1-byte bool (ETW BOOLEAN type)
+        assert!(bool::from_bytes(&[0x01]));
+        assert!(!bool::from_bytes(&[0x00]));
+    }
+
+    // ========================================================================
+    // tdh_types_compatible / find_wide_null unaligned path
+    // ========================================================================
+
+    #[test]
+    fn test_tdh_types_compatible_same_group() {
+        assert!(tdh_types_compatible("UInt64", "FileTime"));
+        assert!(tdh_types_compatible("UInt32", "HexInt32"));
+        assert!(tdh_types_compatible("Pointer", "SizeT"));
+        assert!(tdh_types_compatible("UInt16", "UnicodeChar"));
+        assert!(tdh_types_compatible("UInt8", "AnsiChar"));
+        assert!(tdh_types_compatible(
+            "UnicodeString",
+            "ManifestCountedString"
+        ));
+        assert!(tdh_types_compatible(
+            "AnsiString",
+            "ManifestCountedAnsiString"
+        ));
+        assert!(tdh_types_compatible("Binary", "ManifestCountedBinary"));
+    }
+
+    #[test]
+    fn test_tdh_types_compatible_exact_match() {
+        assert!(tdh_types_compatible("UInt32", "UInt32"));
+        assert!(tdh_types_compatible("UnicodeString", "UnicodeString"));
+    }
+
+    #[test]
+    fn test_tdh_types_compatible_different_groups_returns_false() {
+        assert!(!tdh_types_compatible("UInt32", "UInt64"));
+        assert!(!tdh_types_compatible("UnicodeString", "AnsiString"));
+    }
+
+    #[test]
+    fn test_find_wide_null_unaligned_path() {
+        // Create a buffer with an odd-aligned substring to force the byte-pair fallback.
+        // Heap allocations are aligned to ≥ 8 bytes, so buf[1..] has an odd address.
+        let mut buf = vec![0xFFu8; 9];
+        // Place a wide null (0x00, 0x00) at bytes [3..5] relative to buf start.
+        // Relative to buf[1..], that's index 2.
+        buf[3] = 0x00;
+        buf[4] = 0x00;
+        // scan_past_wide_string(&buf[1..], 0) would test this, but the API takes a global
+        // offset. We call scan_past_wide_string with start_offset=1 on buf instead.
+        // buf[1..] has odd alignment → exercises the fallback byte-pair scan.
+        let result = scan_past_wide_string(&buf, 1).expect("should find null");
+        // null found at offset 3-4 in buf, i.e. byte 2 relative to buf[1..]; returns 1+2+2=5
+        assert_eq!(result, 5);
+    }
+
+    // ========================================================================
+    // validate_schema error path tests
+    // ========================================================================
+    //
+    // These tests validate against the real Windows TDH registry using
+    // Microsoft-Windows-Kernel-Process (ProcessStart, event ID 1, version 4),
+    // which is always registered on Windows 10+.
+
+    #[cfg(windows)]
+    mod validate_schema_tests {
+        use super::super::*;
+
+        const PROCESS_GUID: crate::Guid =
+            crate::Guid::from_u128(0x22fb2cd6_0e7b_422b_a0c7_2fad1fd0e716);
+        const PROCESS_START_ID: u16 = 1;
+
+        /// ProcessStart V4 fields as reported by TDH.
+        fn process_start_v4_fields() -> Vec<StaticFieldInfo> {
+            vec![
+                StaticFieldInfo {
+                    name: "ProcessID",
+                    expected_tdh_type: Some("UInt32"),
+                    required_property_flags: 0,
+                },
+                StaticFieldInfo {
+                    name: "ProcessSequenceNumber",
+                    expected_tdh_type: Some("UInt64"),
+                    required_property_flags: 0,
+                },
+                StaticFieldInfo {
+                    name: "CreateTime",
+                    expected_tdh_type: Some("FileTime"),
+                    required_property_flags: 0,
+                },
+                StaticFieldInfo {
+                    name: "ParentProcessID",
+                    expected_tdh_type: Some("UInt32"),
+                    required_property_flags: 0,
+                },
+                StaticFieldInfo {
+                    name: "ParentProcessSequenceNumber",
+                    expected_tdh_type: Some("UInt64"),
+                    required_property_flags: 0,
+                },
+                StaticFieldInfo {
+                    name: "SessionID",
+                    expected_tdh_type: Some("UInt32"),
+                    required_property_flags: 0,
+                },
+                StaticFieldInfo {
+                    name: "Flags",
+                    expected_tdh_type: Some("UInt32"),
+                    required_property_flags: 0,
+                },
+                StaticFieldInfo {
+                    name: "ProcessTokenElevationType",
+                    expected_tdh_type: Some("UInt32"),
+                    required_property_flags: 0,
+                },
+                StaticFieldInfo {
+                    name: "ProcessTokenIsElevated",
+                    expected_tdh_type: Some("UInt32"),
+                    required_property_flags: 0,
+                },
+                StaticFieldInfo {
+                    name: "MandatoryLabel",
+                    expected_tdh_type: Some("SID"),
+                    required_property_flags: 0,
+                },
+                StaticFieldInfo {
+                    name: "ImageName",
+                    expected_tdh_type: Some("UnicodeString"),
+                    required_property_flags: 0,
+                },
+                StaticFieldInfo {
+                    name: "ImageChecksum",
+                    expected_tdh_type: Some("UInt32"),
+                    required_property_flags: 0,
+                },
+                StaticFieldInfo {
+                    name: "TimeDateStamp",
+                    expected_tdh_type: Some("UInt32"),
+                    required_property_flags: 0,
+                },
+                StaticFieldInfo {
+                    name: "PackageFullName",
+                    expected_tdh_type: Some("UnicodeString"),
+                    required_property_flags: 0,
+                },
+                StaticFieldInfo {
+                    name: "PackageRelativeAppId",
+                    expected_tdh_type: Some("UnicodeString"),
+                    required_property_flags: 0,
+                },
+                StaticFieldInfo {
+                    name: "SecurityMitigations",
+                    expected_tdh_type: Some("UInt32"),
+                    required_property_flags: 0,
+                },
+            ]
+        }
+
+        #[test]
+        #[cfg_attr(miri, ignore = "calls TdhGetEventInformation (Win32)")]
+        fn correct_schema_passes() {
+            let fields = process_start_v4_fields();
+            let leaked: &'static [StaticFieldInfo] = Vec::leak(fields);
+            let versions = [StaticVersionInfo {
+                version: 4,
+                fields: leaked,
+                truncated: false,
+            }];
+            validate_schema(&PROCESS_GUID, PROCESS_START_ID, 0, false, &versions, &[])
+                .expect("correct schema should pass validation");
+        }
+
+        #[test]
+        #[cfg_attr(miri, ignore = "calls TdhGetEventInformation (Win32)")]
+        fn wrong_field_name_detected() {
+            let mut fields = process_start_v4_fields();
+            fields[0].name = "WrongName"; // ProcessID -> WrongName
+            let leaked: &'static [StaticFieldInfo] = Vec::leak(fields);
+            let versions = [StaticVersionInfo {
+                version: 4,
+                fields: leaked,
+                truncated: false,
+            }];
+            let err = validate_schema(&PROCESS_GUID, PROCESS_START_ID, 0, false, &versions, &[])
+                .expect_err("should detect wrong field name");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("name mismatch"),
+                "error should mention name mismatch, got: {msg}"
+            );
+        }
+
+        #[test]
+        #[cfg_attr(miri, ignore = "calls TdhGetEventInformation (Win32)")]
+        fn wrong_field_type_detected() {
+            let mut fields = process_start_v4_fields();
+            // ProcessID is UInt32, claim it's UInt64 (not compatible via tdh_types_compatible)
+            fields[0].expected_tdh_type = Some("UInt64");
+            let leaked: &'static [StaticFieldInfo] = Vec::leak(fields);
+            let versions = [StaticVersionInfo {
+                version: 4,
+                fields: leaked,
+                truncated: false,
+            }];
+            let err = validate_schema(&PROCESS_GUID, PROCESS_START_ID, 0, false, &versions, &[])
+                .expect_err("should detect wrong field type");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("type mismatch"),
+                "error should mention type mismatch, got: {msg}"
+            );
+        }
+
+        #[test]
+        #[cfg_attr(miri, ignore = "calls TdhGetEventInformation (Win32)")]
+        fn wrong_field_count_detected() {
+            // Provide only the first 5 fields with truncated: false — count mismatch.
+            let fields = process_start_v4_fields();
+            let short: Vec<StaticFieldInfo> = fields.into_iter().take(5).collect();
+            let leaked: &'static [StaticFieldInfo] = Vec::leak(short);
+            let versions = [StaticVersionInfo {
+                version: 4,
+                fields: leaked,
+                truncated: false,
+            }];
+            let err = validate_schema(&PROCESS_GUID, PROCESS_START_ID, 0, false, &versions, &[])
+                .expect_err("should detect wrong field count");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("expected"),
+                "error should mention expected count, got: {msg}"
+            );
+            assert!(
+                msg.contains('5'),
+                "error should mention the expected count of 5, got: {msg}"
+            );
+        }
+
+        #[test]
+        #[cfg_attr(miri, ignore = "calls TdhGetEventInformation (Win32)")]
+        fn truncated_schema_allows_fewer_fields() {
+            // First 5 fields with truncated: true — should pass since TDH has >= 5.
+            let fields = process_start_v4_fields();
+            let short: Vec<StaticFieldInfo> = fields.into_iter().take(5).collect();
+            let leaked: &'static [StaticFieldInfo] = Vec::leak(short);
+            let versions = [StaticVersionInfo {
+                version: 4,
+                fields: leaked,
+                truncated: true,
+            }];
+            validate_schema(&PROCESS_GUID, PROCESS_START_ID, 0, false, &versions, &[])
+                .expect("truncated schema with fewer fields should pass");
+        }
+
+        #[test]
+        #[cfg_attr(miri, ignore = "calls TdhGetEventInformation (Win32)")]
+        fn unregistered_provider_skips() {
+            let fake_guid = crate::Guid::from_u128(0xdeadbeef_dead_beef_dead_beefdeadbeef);
+            let fields = process_start_v4_fields();
+            let leaked: &'static [StaticFieldInfo] = Vec::leak(fields);
+            let versions = [StaticVersionInfo {
+                version: 4,
+                fields: leaked,
+                truncated: false,
+            }];
+            validate_schema(&fake_guid, 1, 0, false, &versions, &[])
+                .expect("unregistered provider should return Ok, not Err");
+        }
+    }
+}

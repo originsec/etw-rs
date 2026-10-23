@@ -1,0 +1,37 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+*.etl
+
+# Benchmark captures (live_events/comparison benches)
+captured_*.bin
+
+# C++ benchmark dependencies/build artefacts
+benches/krabsetw/
+benches/build/
+
+# Claude Code — local state; shared config is opted in below
+.claude/*
+!.claude/settings.json
+!.claude/commands/
+!.claude/agents/
+!.claude/skills/
+!.claude/hooks/
+
+# Factory tooling
+.factory/

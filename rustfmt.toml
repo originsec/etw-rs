@@ -1,0 +1,37 @@
+# rustfmt configuration for etw-rs
+# See: https://rust-lang.github.io/rustfmt
+#
+# WARNING: This config requires nightly rustfmt. Stable `cargo fmt` does not
+# fail: it warns, drops the nightly-only options below, and formats with the
+# rest. Use the pinned nightly through the check script:
+#
+#   ./ci/check.ps1 fmt -Fix
+
+# Stable options
+edition = "2024"                    # Match Cargo.toml edition
+max_width = 100                     # Default, explicit for clarity
+hard_tabs = false                   # Use spaces for indentation
+tab_spaces = 4                      # Standard Rust indentation
+newline_style = "Unix"              # LF everywhere (Rust ecosystem convention)
+use_small_heuristics = "Default"    # Balance between line breaks and width
+fn_call_width = 60                  # Break long function calls for readability
+attr_fn_like_width = 70             # Break long attribute macros
+struct_lit_width = 18               # Break long struct literals
+struct_variant_width = 35           # Break long enum variants
+array_width = 60                    # Break long arrays
+chain_width = 60                    # Break long method chains
+use_field_init_shorthand = true     # Use field shorthand when possible
+use_try_shorthand = true            # Use ? instead of try!
+force_explicit_abi = true           # Always show extern "C" explicitly
+reorder_imports = true              # Sort imports alphabetically
+reorder_modules = true              # Sort module declarations alphabetically
+
+# Nightly-only options
+wrap_comments = true               # Wrap comments to comment_width
+comment_width = 100                # Match max_width for comments
+group_imports = "One"              # Single block for all imports
+imports_granularity = "Crate"      # Merge imports from same crate
+format_code_in_doc_comments = true # Format code blocks in doc comments
+normalize_comments = true          # Normalise comment style (/* */ → //)
+normalize_doc_attributes = true    # Normalise #[doc = "..."] → /// ...
+error_on_line_overflow = true      # Fail on code lines rustfmt cannot fit, not skip them silently

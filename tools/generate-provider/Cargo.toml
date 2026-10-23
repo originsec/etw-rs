@@ -1,0 +1,44 @@
+[package]
+# The package is namespaced for crates.io; the installed binary is still
+# `generate-provider` via [[bin]], so generated-file comments stay accurate.
+name = "etw-rs-generate-provider"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+authors = ["John Uhlmann <john@originhq.com>"]
+license = "Apache-2.0"
+description = "CLI tool to generate ETW provider definitions from registered metadata"
+repository = "https://github.com/originsec/etw-rs"
+keywords = ["etw", "windows", "code-generation"]
+categories = ["command-line-utilities", "os::windows-apis"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+# `version` is what crates.io consumers resolve; `path` wins for local builds.
+etw-rs = { path = "../..", version = "0.1.0" }
+log = "0.4"
+serde_json = "1"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_Etw",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_System_Wmi",
+] }
+
+[lib]
+name = "generate_provider"
+path = "src/lib.rs"
+
+[[bin]]
+name = "generate-provider"
+path = "src/main.rs"
+
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"
+targets = ["x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]
+
+[lints]
+workspace = true

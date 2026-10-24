@@ -40,7 +40,7 @@
 mod differential;
 
 use differential::{
-    ERROR_INVALID_PARAMETER, LEAD, SENTINEL, TestRecord, ansiz, compare_event_with_tdh,
+    ERROR_INVALID_PARAMETER, LEAD, Regime, SENTINEL, TestRecord, ansiz, compare_event_with_tdh,
     load_fixture_manifest, payload, sid, tdh_property_bytes, tdh_property_bytes_at,
     tdh_struct_member_bytes, utf16z, with_sentinel,
 };
@@ -532,6 +532,7 @@ fn every_property_agrees_with_tdh() {
             &f.label,
             f.record.as_raw_event(),
             &mut ctx,
+            Regime::ManifestOrMof,
         ));
     }
 

@@ -660,6 +660,36 @@ impl RawEvent {
             .map(|item| item.data)
     }
 
+    /// Returns the TraceLogging event-schema metadata for this event, if present.
+    ///
+    /// TraceLogging (self-describing) events carry their schema — the event name
+    /// and field layout — inline as an
+    /// [`EVENT_SCHEMA_TL`](extended_data_type::EVENT_SCHEMA_TL) extended-data
+    /// item, rather than in a separately registered manifest. The presence of
+    /// this item is the definitive signal that an event is a TraceLogging event;
+    /// its absence means the event is manifest- or MOF-based.
+    ///
+    /// The returned bytes are the raw metadata blob (a size-prefixed, UTF-8 event
+    /// name followed by field descriptors). Because that blob fully and uniquely
+    /// describes the event's schema, it — not the event name, id, or keyword,
+    /// none of which are guaranteed unique across a TraceLogging provider's
+    /// events — is the sound key for caching a decoded schema.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use etw::RawEvent;
+    /// # fn example(event: &RawEvent) {
+    /// if event.tracelogging_metadata().is_some() {
+    ///     // This event is TraceLogging (self-describing).
+    /// }
+    /// # }
+    /// ```
+    #[inline]
+    pub fn tracelogging_metadata(&self) -> Option<&[u8]> {
+        self.find_extended_data(extended_data_type::EVENT_SCHEMA_TL)
+    }
+
     /// Returns the security identifier (SID) of the logging thread's user.
     ///
     /// The SID identifies the user account of the **logging thread** — the

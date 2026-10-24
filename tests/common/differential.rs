@@ -268,6 +268,18 @@ pub fn tdh_struct_member_bytes(
     Ok(buf)
 }
 
+/// Which decode path a subject event uses.
+///
+/// Mirrors the library's `parser()` / `tracelogging_parser()` split: the regime is
+/// a fixed property of the provider, stated by the caller rather than detected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Regime {
+    /// Schema comes from a registered manifest or MOF class.
+    ManifestOrMof,
+    /// Schema is carried inline with each event (self-describing).
+    TraceLogging,
+}
+
 /// Compares every property etw-rs finds against TDH's view of the same event.
 ///
 /// Returns one description per disagreement. Shared by the offline fixtures and
@@ -276,10 +288,15 @@ pub fn compare_event_with_tdh(
     label: &str,
     event: &RawEvent,
     ctx: &mut etw::processing_context::ProcessingContext,
+    regime: Regime,
 ) -> Vec<String> {
     let mut problems = Vec::new();
 
-    let mut parser = match ctx.parser(event) {
+    let built = match regime {
+        Regime::ManifestOrMof => ctx.parser(event),
+        Regime::TraceLogging => ctx.tracelogging_parser(event),
+    };
+    let mut parser = match built {
         Ok(p) => p,
         Err(e) => {
             problems.push(format!("{label}: etw-rs could not build a parser: {e}"));

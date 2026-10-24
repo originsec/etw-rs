@@ -33,7 +33,7 @@ mod common;
 #[path = "common/differential.rs"]
 mod differential;
 
-use differential::{LEAD, SENTINEL, compare_event_with_tdh};
+use differential::{LEAD, Regime, SENTINEL, compare_event_with_tdh};
 use etw::{ALL_KEYWORDS, Trace};
 use std::{
     sync::{Arc, Mutex},
@@ -184,16 +184,12 @@ fn tracelogging_fields_agree_with_tdh_and_intent() {
 
         let mut entry = Captured::default();
 
-        // A fresh context per event, deliberately, rather than the session's shared
-        // one. Every TraceLogging event carries EventDescriptor.Id/Version/Opcode of
-        // zero — the event's identity lives in its metadata blob — so the shared
-        // cache, keyed on those fields, hands back the first event's schema for all
-        // of them. That defect has its own regression test in
-        // `tests/tracelogging_schema_cache.rs`; isolating it here keeps this test
-        // measuring field decoding rather than failing for an unrelated reason.
+        // A fresh context per event, rather than the session's shared one, so this
+        // test measures field decoding alone. The caching contract is pinned
+        // separately by `tests/tracelogging_schema_cache.rs`.
         let mut ctx = etw::processing_context::ProcessingContext::new();
 
-        let Ok(mut parser) = ctx.parser(event) else {
+        let Ok(mut parser) = ctx.tracelogging_parser(event) else {
             entry.problems.push("parser construction failed".to_owned());
             sink.lock().expect("captured mutex poisoned").push(entry);
             return Ok(());
@@ -211,9 +207,12 @@ fn tracelogging_fields_agree_with_tdh_and_intent() {
             }
         }
         let mut cmp_ctx = etw::processing_context::ProcessingContext::new();
-        entry
-            .problems
-            .extend(compare_event_with_tdh(&entry.name, event, &mut cmp_ctx));
+        entry.problems.extend(compare_event_with_tdh(
+            &entry.name,
+            event,
+            &mut cmp_ctx,
+            Regime::TraceLogging,
+        ));
 
         sink.lock().expect("captured mutex poisoned").push(entry);
         Ok(())

@@ -688,6 +688,10 @@ impl PropertyInfo<'_> {
     }
 }
 
+/// A cached schema paired with the parser cache built for it — the value stored
+/// in both the manifest and the TraceLogging caches.
+type CachedSchema = (EventSchema, ParserCache);
+
 /// Cache for event schemas to avoid repeated TDH lookups.
 ///
 /// Each schema is paired with the parser cache holding its computed property
@@ -698,7 +702,17 @@ impl PropertyInfo<'_> {
 /// Note: This cache is not `Sync` or `Send`. Use separate caches per thread,
 /// or wrap in a mutex if shared access is required.
 pub struct ProcessingContext {
-    cache: FxHashMap<SchemaKey, (EventSchema, ParserCache)>,
+    /// Manifest and MOF events, keyed by [`SchemaKey`] (provider GUID + packed
+    /// discriminator / version / flags, pointer size included).
+    cache: FxHashMap<SchemaKey, CachedSchema>,
+    /// TraceLogging (self-describing) events. Their `EventDescriptor` carries no
+    /// usable identity — `Id`/`Version`/`Opcode` are ~always 0 — so they are keyed
+    /// by the raw `EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL` metadata blob, which *is*
+    /// the schema. Pointer size still sizes `Pointer`/`SizeT` properties, so —
+    /// mirroring the manifest key's bitness bit — the two bitnesses use separate
+    /// maps (index 0 = 32-bit, 1 = 64-bit); the blob is looked up borrowed so a
+    /// cache hit allocates nothing.
+    tlg_cache: [FxHashMap<Box<[u8]>, CachedSchema>; 2],
 }
 
 impl Default for ProcessingContext {
@@ -711,6 +725,10 @@ impl std::fmt::Debug for ProcessingContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProcessingContext")
             .field("cached_schemas", &self.cache.len())
+            .field(
+                "cached_tracelogging_schemas",
+                &(self.tlg_cache[0].len() + self.tlg_cache[1].len()),
+            )
             .finish()
     }
 }
@@ -723,6 +741,7 @@ impl ProcessingContext {
     pub fn new() -> Self {
         Self {
             cache: FxHashMap::default(),
+            tlg_cache: [FxHashMap::default(), FxHashMap::default()],
         }
     }
 
@@ -733,6 +752,7 @@ impl ProcessingContext {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             cache: FxHashMap::with_capacity_and_hasher(capacity, FxBuildHasher),
+            tlg_cache: [FxHashMap::default(), FxHashMap::default()],
         }
     }
 
@@ -754,20 +774,94 @@ impl ProcessingContext {
     ///
     /// Returns error if TDH lookup fails (e.g., schema not found).
     pub fn get_or_lookup_raw(&mut self, event: &EVENT_RECORD) -> Result<&EventSchema> {
+        Ok(&self.resolve_entry(event)?.0)
+    }
+
+    /// Looks up (or builds and caches) the schema and parser cache for a
+    /// manifest or MOF event, keyed by [`SchemaKey`].
+    ///
+    /// This is the manifest hot path: it never inspects extended data. Callers
+    /// consuming a TraceLogging provider use
+    /// [`tracelogging_parser`](Self::tracelogging_parser) instead — which regime a
+    /// provider uses is a fixed property of the provider, known when it is enabled,
+    /// so the choice is the caller's and costs nothing to express.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the schema is not already cached and the TDH lookup
+    /// fails.
+    fn resolve_entry(&mut self, event: &EVENT_RECORD) -> Result<&mut CachedSchema> {
         use std::collections::hash_map::Entry;
+
+        // A TraceLogging event reaching this path would be keyed by an
+        // `EventDescriptor` that carries no identity — every event from the
+        // provider would collide on one entry and silently decode from the wrong
+        // offsets. Caught in debug builds only, so the release hot path keeps
+        // paying nothing for the check; the same convention the static-schema
+        // parsers use for their provider/id/version guards.
+        debug_assert!(
+            {
+                // SAFETY: `event` is a live EVENT_RECORD for this call, and
+                // `RawEvent` is #[repr(transparent)] over EVENT_RECORD.
+                let raw = unsafe { RawEvent::from_ptr(std::ptr::from_ref(event)) };
+                raw.tracelogging_metadata().is_none()
+            },
+            "TraceLogging event passed to the manifest parser; use \
+             ProcessingContext::tracelogging_parser instead"
+        );
 
         let pointer_size = pointer_size_from_flags(event.EventHeader.Flags as u32);
         let key = SchemaKey::from_event_record(event);
 
-        match self.cache.entry(key) {
-            Entry::Occupied(entry) => Ok(&entry.into_mut().0),
+        Ok(match self.cache.entry(key) {
+            Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
                 let schema = lookup_event_schema(event)?;
                 let mut cache = ParserCache::new(schema.top_level_property_count());
                 cache.prepopulate_fixed(&schema, pointer_size as usize);
-                Ok(&entry.insert((schema, cache)).0)
+                entry.insert((schema, cache))
             }
+        })
+    }
+
+    /// Looks up (or builds and caches) the schema and parser cache for a
+    /// TraceLogging event, keyed by its metadata blob.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotPresent`](crate::Error::NotPresent) if the event carries no
+    /// `EVENT_SCHEMA_TL` item — it is not a TraceLogging event — or an error if
+    /// the schema is not already cached and the TDH lookup fails.
+    fn resolve_tracelogging_entry(&mut self, event: &EVENT_RECORD) -> Result<&mut CachedSchema> {
+        // SAFETY: `event` is a live EVENT_RECORD for this call, and `RawEvent` is
+        // #[repr(transparent)] over EVENT_RECORD.
+        let raw = unsafe { RawEvent::from_ptr(std::ptr::from_ref(event)) };
+
+        // Not detection — this blob *is* the cache key, so a TraceLogging caller
+        // has to read it regardless. Its absence means the record is not
+        // TraceLogging at all (ETW also delivers session bookkeeping such as the
+        // `EventTrace` header and lost-event records), which is an error here
+        // rather than something to silently decode the wrong way.
+        let blob = raw.tracelogging_metadata().ok_or(Error::NotPresent {
+            kind: crate::event::extended_data_type::EVENT_SCHEMA_TL,
+        })?;
+
+        let pointer_size = pointer_size_from_flags(event.EventHeader.Flags as u32);
+
+        // Bitness selects the map. Look up borrowed so a hit allocates nothing —
+        // only a miss clones the blob into an owned key. (The manifest path can use
+        // the `Entry` API because its key is a cheap `Copy`; here that would
+        // allocate on every call.)
+        let map = &mut self.tlg_cache[usize::from(pointer_size == 8)];
+        if !map.contains_key(blob) {
+            let schema = lookup_event_schema(event)?;
+            let mut cache = ParserCache::new(schema.top_level_property_count());
+            cache.prepopulate_fixed(&schema, pointer_size as usize);
+            map.insert(Box::from(blob), (schema, cache));
         }
+        map.get_mut(blob).ok_or_else(|| {
+            Error::parse("TraceLogging schema entry missing immediately after insert")
+        })
     }
 
     /// Returns the number of cached entries.
@@ -777,19 +871,21 @@ impl ProcessingContext {
     /// schema and offset table.
     #[inline]
     pub fn len(&self) -> usize {
-        self.cache.len()
+        self.cache.len() + self.tlg_cache[0].len() + self.tlg_cache[1].len()
     }
 
     /// Returns true if the cache is empty.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.cache.is_empty()
+        self.cache.is_empty() && self.tlg_cache[0].is_empty() && self.tlg_cache[1].is_empty()
     }
 
     /// Clears all cached schemas.
     #[inline]
     pub fn clear(&mut self) {
         self.cache.clear();
+        self.tlg_cache[0].clear();
+        self.tlg_cache[1].clear();
     }
 
     /// Returns an `EventParser` for the given event.
@@ -806,23 +902,57 @@ impl ProcessingContext {
     ///
     /// Returns error if schema lookup fails.
     pub fn parser<'a>(&'a mut self, event: &'a RawEvent) -> Result<EventParser<'a>> {
-        use std::collections::hash_map::Entry;
-
-        let raw = event.as_raw();
-        let pointer_size = pointer_size_from_flags(raw.EventHeader.Flags as u32);
-        let key = SchemaKey::from_event_record(raw);
-
-        let (schema, cache) = match self.cache.entry(key) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => {
-                let schema = lookup_event_schema(raw)?;
-                let mut cache = ParserCache::new(schema.top_level_property_count());
-                cache.prepopulate_fixed(&schema, pointer_size as usize);
-                entry.insert((schema, cache))
-            }
-        };
-
+        let (schema, cache) = self.resolve_entry(event.as_raw())?;
         Ok(EventParser::new(event, schema, cache))
+    }
+
+    /// Returns an `EventParser` for a TraceLogging (self-describing) event.
+    ///
+    /// Use this for providers that emit TraceLogging events; use
+    /// [`parser`](Self::parser) for manifest and MOF providers. Which regime a
+    /// provider uses is a fixed property of that provider, known when you enable
+    /// it, so neither path spends anything working it out per event.
+    ///
+    /// TraceLogging events cannot share the manifest cache: their
+    /// `EventDescriptor` is effectively empty — `Id`, `Version` and `Opcode` are
+    /// almost always 0 — so every event from a provider would collide on a single
+    /// entry and decode from another event's offsets. They are cached instead by
+    /// the `EVENT_SCHEMA_TL` metadata blob that each event carries, which is the
+    /// schema itself and therefore identifies it exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotPresent`](crate::Error::NotPresent) if the event is not a
+    /// TraceLogging event (it carries no `EVENT_SCHEMA_TL` metadata), or an error
+    /// if the schema lookup fails.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use etw::{RawEvent, processing_context::ProcessingContext};
+    /// # fn example(event: &RawEvent, context: &mut ProcessingContext) -> etw::Result<()> {
+    /// let mut parser = context.tracelogging_parser(event)?;
+    /// let name = parser.schema().event_name().unwrap_or_default();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn tracelogging_parser<'a>(&'a mut self, event: &'a RawEvent) -> Result<EventParser<'a>> {
+        let (schema, cache) = self.resolve_tracelogging_entry(event.as_raw())?;
+        Ok(EventParser::new(event, schema, cache))
+    }
+
+    /// Looks up or retrieves the schema for a TraceLogging (self-describing) event.
+    ///
+    /// The schema-only counterpart to
+    /// [`tracelogging_parser`](Self::tracelogging_parser), for callers that want
+    /// the event name or property metadata without parsing values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NotPresent`](crate::Error::NotPresent) if the event is not a
+    /// TraceLogging event, or an error if the TDH lookup fails.
+    pub fn get_or_lookup_tracelogging(&mut self, event: &RawEvent) -> Result<&EventSchema> {
+        Ok(&self.resolve_tracelogging_entry(event.as_raw())?.0)
     }
 }
 

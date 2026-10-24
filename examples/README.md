@@ -18,6 +18,7 @@ cargo run --example 01_simple_trace
 | `05_delayed_stack_walks` | Deferred stack walk collection |
 | `06_rundown_events` | Rundown events for process/assembly state enumeration |
 | `07_manual` | Low-level Win32 API usage (direct `EnableTraceEx2`, raw UserData) |
+| `09_tracelogging` | TraceLogging (self-describing) events via `tracelogging_parser()`, using the kernel `KernelProcess` provider |
 
 ### System Logger Mode
 

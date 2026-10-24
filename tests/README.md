@@ -133,6 +133,7 @@ validate event capture and parsing.
 | `kernel_file.rs` | Microsoft-Windows-Kernel-File | File I/O events |
 | `32bit_events.rs` | DNS-Client + DotNETRuntime | 32-bit event parsing; Pointer fields from 32-bit process (requires 32-bit PowerShell) |
 | `mixed_bitness_events.rs` | DotNETRuntime | Schema cache keyed on pointer size: 32-bit and 64-bit events in one session, both cache-population orders (requires 32-bit PowerShell) |
+| `tracelogging_schema_cache.rs` | Self-registered TraceLogging provider | Schema cache keyed on the TraceLogging metadata blob: three event shapes, all with `EventDescriptor.Id` 0, each resolve to their own schema through one shared context |
 | `system_process.rs` | System logger (PERF_PROCESS) | Kernel process events via system logger mode |
 | `system_network.rs` | System logger (PERF_NETWORK) | TCP/UDP events via system logger mode |
 | `system_object.rs` | System logger (PERF_OB_HANDLE) | Object manager handle create/close events |

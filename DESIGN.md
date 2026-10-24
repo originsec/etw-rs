@@ -279,7 +279,13 @@ for efficient parsing across events of the same type:
 
 ```rust
 pub struct ProcessingContext {
+    // Manifest/MOF events, keyed by the packed SchemaKey (pointer size included).
     cache: FxHashMap<SchemaKey, (EventSchema, ParserCache)>,
+    // TraceLogging (self-describing) events. Id/Version/Opcode are ~always 0, so
+    // they cannot share the SchemaKey space; keyed instead by the raw
+    // EVENT_SCHEMA_TL metadata blob bytes. Split into a 32-bit and a 64-bit map,
+    // since pointer size still sizes Pointer/SizeT properties.
+    tlg_cache: [FxHashMap<Box<[u8]>, (EventSchema, ParserCache)>; 2],
 }
 
 pub struct EventSchema {

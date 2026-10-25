@@ -343,6 +343,30 @@ fn variable_types_at_first_position() -> etw::Result<()> {
     Ok(())
 }
 
+#[test]
+fn wide_owned_accessors_keep_lone_surrogate() -> etw::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let payload = [0x48u8, 0x00, 0x00, 0xD8];
+
+    let mut d = payload.to_vec();
+    d.extend_from_slice(&[0, 0]);
+    d.extend_from_slice(&0xCAFEu32.to_le_bytes());
+    let mut p = WideFirstV0Parser::from_bytes(&d);
+    let s: std::ffi::OsString = p.Target()?;
+    assert_eq!(s.encode_wide().collect::<Vec<_>>(), [0x48, 0xD800]);
+    assert_eq!(p.Sentinel()?, 0xCAFE);
+
+    let mut d = 4u16.to_le_bytes().to_vec();
+    d.extend_from_slice(&payload);
+    d.extend_from_slice(&0x1111u32.to_le_bytes());
+    let mut p = CWideFirstV0Parser::from_bytes(&d);
+    let s: std::ffi::OsString = p.Target()?;
+    assert_eq!(s.encode_wide().collect::<Vec<_>>(), [0x48, 0xD800]);
+    assert_eq!(p.Sentinel()?, 0x1111);
+
+    Ok(())
+}
+
 // =============================================================================
 // Fixed types after variable field (WideStrRef — even offset after null)
 // =============================================================================

@@ -150,7 +150,7 @@ fn handle_process_start(event: &RawEvent, context: &mut ProcessingContext) -> et
     let mut parser = process::ProcessStartParser::new(event, context)?;
     let pid = parser.ProcessID()?;
     let image = parser.ImageName()?;
-    println!("[PROCESS] Started: {image} (PID: {pid})");
+    println!("[PROCESS] Started: {} (PID: {pid})", image.display());
     Ok(())
 }
 
@@ -166,14 +166,14 @@ fn handle_process_stop(event: &RawEvent, context: &mut ProcessingContext) -> etw
 fn handle_name_create(event: &RawEvent, context: &mut ProcessingContext) -> etw::Result<()> {
     let mut parser = file::NameCreateParser::new(event, context)?;
     let filename = parser.FileName()?;
-    println!("[FILE]    Create: {filename}");
+    println!("[FILE]    Create: {}", filename.display());
     Ok(())
 }
 
 fn handle_name_delete(event: &RawEvent, context: &mut ProcessingContext) -> etw::Result<()> {
     let mut parser = file::NameDeleteParser::new(event, context)?;
     let filename = parser.FileName()?;
-    println!("[FILE]    Delete: {filename}");
+    println!("[FILE]    Delete: {}", filename.display());
     Ok(())
 }
 
@@ -182,7 +182,10 @@ fn handle_lost_event(event: &RawEvent, context: &mut ProcessingContext) -> etw::
     let provider = parser.ProviderId()?;
     let id = parser.EventId()?;
     let session = parser.SessionName()?;
-    println!("[LOST] ETW event lost - Provider:{provider} Id:{id} Session:{session}");
+    println!(
+        "[LOST] ETW event lost - Provider:{provider} Id:{id} Session:{}",
+        session.display()
+    );
     Ok(())
 }
 
@@ -195,7 +198,10 @@ fn handle_lost_trace_logging_event(
     // EventName is ANSI — the `String` conversion decodes it with the active code page.
     let name = parser.EventName()?;
     let session = parser.SessionName()?;
-    println!("[LOST] TraceLogging event lost - Provider:{provider} Name:{name} Session:{session}");
+    println!(
+        "[LOST] TraceLogging event lost - Provider:{provider} Name:{name} Session:{}",
+        session.display()
+    );
     Ok(())
 }
 
@@ -204,7 +210,10 @@ fn handle_lost_wpp_event(event: &RawEvent, context: &mut ProcessingContext) -> e
     let provider = parser.MessageGuid()?;
     let id = parser.MessageNumber()?;
     let session = parser.SessionName()?;
-    println!("[LOST] WPP event lost - Provider:{provider} Id:{id} Session:{session}");
+    println!(
+        "[LOST] WPP event lost - Provider:{provider} Id:{id} Session:{}",
+        session.display()
+    );
     Ok(())
 }
 
@@ -212,6 +221,9 @@ fn handle_lost_system_event(event: &RawEvent, context: &mut ProcessingContext) -
     let mut parser = etw_subsystem::LostSystemEventParser::new(event, context)?;
     let hook_id = parser.HookId()?;
     let session = parser.SessionName()?;
-    println!("[LOST] System event lost - Id:{hook_id:#x} Session:{session}");
+    println!(
+        "[LOST] System event lost - Id:{hook_id:#x} Session:{}",
+        session.display()
+    );
     Ok(())
 }

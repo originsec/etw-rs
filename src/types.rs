@@ -795,6 +795,27 @@ impl<'a> WideStrRef<'a> {
         s
     }
 
+    /// Convert to an owned [`OsString`](std::ffi::OsString) without loss.
+    ///
+    /// Unlike [`decode_utf16()`](Self::decode_utf16) this cannot fail, and unlike
+    /// [`to_string_lossy()`](Self::to_string_lossy) it preserves unpaired surrogates,
+    /// which Windows permits in file names, registry keys and other identifiers.
+    #[must_use]
+    pub fn to_os_string(&self) -> std::ffi::OsString {
+        use std::os::windows::ffi::OsStringExt;
+        if let Some(wide) = self.as_wide_slice() {
+            return std::ffi::OsString::from_wide(wide);
+        }
+        let wide: Vec<u16> = self
+            .data
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        std::ffi::OsString::from_wide(&wide)
+    }
+
     /// Compare against an ASCII string without allocation.
     ///
     /// Returns `false` if `other` contains non-ASCII characters.
@@ -1334,6 +1355,15 @@ impl WideString {
     #[must_use]
     pub fn to_string_lossy(&self) -> String {
         String::from_utf16_lossy(&self.data)
+    }
+
+    /// Convert to an owned [`OsString`](std::ffi::OsString) without loss.
+    ///
+    /// See [`WideStrRef::to_os_string`].
+    #[must_use]
+    pub fn to_os_string(&self) -> std::ffi::OsString {
+        use std::os::windows::ffi::OsStringExt;
+        std::ffi::OsString::from_wide(&self.data)
     }
 
     /// Borrow as a `WideStrRef`.
@@ -3289,5 +3319,35 @@ mod tests {
             w.to_string_lossy().contains('\u{FFFD}'),
             "expected replacement char for lone surrogate"
         );
+    }
+
+    #[test]
+    fn wide_str_ref_to_os_string_preserves_lone_surrogate() {
+        use std::os::windows::ffi::OsStrExt;
+        let units = [0x48, 0xD800, 0x69];
+        let owned = WideString::from_vec(units.to_vec());
+        let w = owned.as_wide_str();
+        assert!(w.as_wide_slice().is_some(), "expected aligned path");
+        assert!(w.decode_utf16().is_err());
+        assert_eq!(w.to_os_string().encode_wide().collect::<Vec<_>>(), units);
+        assert_eq!(owned.to_os_string(), w.to_os_string());
+    }
+
+    #[test]
+    fn wide_str_ref_to_os_string_unaligned_preserves_lone_surrogate() {
+        use std::os::windows::ffi::OsStrExt;
+        let (backing, offset) = unaligned_wide_bytes(&[0x48, 0x00, 0x00, 0xD8]);
+        let slice = &backing[offset..];
+        assert_ne!(slice.as_ptr() as usize % 2, 0);
+        let w = WideStrRef::new(slice);
+        assert_eq!(
+            w.to_os_string().encode_wide().collect::<Vec<_>>(),
+            [0x48, 0xD800]
+        );
+    }
+
+    #[test]
+    fn wide_str_ref_to_os_string_empty() {
+        assert!(WideStrRef::new(&[]).to_os_string().is_empty());
     }
 }

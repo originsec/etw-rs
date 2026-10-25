@@ -928,11 +928,19 @@ fn bench_process_start_static() {
                 process_token_elevation_type: parser.ProcessTokenElevationType().unwrap(),
                 process_token_is_elevated: parser.ProcessTokenIsElevated().unwrap(),
                 mandatory_label: format!("{}", parser.MandatoryLabel().unwrap()),
-                image_name: parser.ImageName().unwrap(),
+                image_name: parser.ImageName_ref().unwrap().decode_utf16().unwrap(),
                 image_checksum: parser.ImageChecksum().unwrap(),
                 time_date_stamp: parser.TimeDateStamp().unwrap(),
-                package_full_name: parser.PackageFullName().unwrap(),
-                package_relative_app_id: parser.PackageRelativeAppId().unwrap(),
+                package_full_name: parser
+                    .PackageFullName_ref()
+                    .unwrap()
+                    .decode_utf16()
+                    .unwrap(),
+                package_relative_app_id: parser
+                    .PackageRelativeAppId_ref()
+                    .unwrap()
+                    .decode_utf16()
+                    .unwrap(),
                 security_mitigations: parser.SecurityMitigations().unwrap(),
             };
 
@@ -1096,7 +1104,7 @@ fn bench_file_create_static() {
                 create_options: parser.CreateOptions().unwrap(),
                 create_attributes: parser.CreateAttributes().unwrap(),
                 share_access: parser.ShareAccess().unwrap(),
-                file_name: parser.FileName().unwrap(),
+                file_name: parser.FileName_ref().unwrap().decode_utf16().unwrap(),
             };
 
             black_box(&parsed);
@@ -1488,8 +1496,8 @@ fn bench_registry_create_key_static() {
                 key_object: parser.KeyObject().unwrap(),
                 status: parser.Status().unwrap(),
                 disposition: parser.Disposition().unwrap(),
-                base_name: parser.BaseName().unwrap(),
-                relative_name: parser.RelativeName().unwrap(),
+                base_name: parser.BaseName_ref().unwrap().decode_utf16().unwrap(),
+                relative_name: parser.RelativeName_ref().unwrap().decode_utf16().unwrap(),
             };
 
             black_box(&parsed);
@@ -1665,9 +1673,9 @@ fn bench_rpc_client_call_static() {
                 interface_uuid: guid_to_u128(parser.InterfaceUuid().unwrap()),
                 proc_num: parser.ProcNum().unwrap(),
                 protocol: parser.Protocol().unwrap(),
-                network_address: parser.NetworkAddress().unwrap(),
-                endpoint: parser.Endpoint().unwrap(),
-                options: parser.Options().unwrap(),
+                network_address: parser.NetworkAddress_ref().unwrap().decode_utf16().unwrap(),
+                endpoint: parser.Endpoint_ref().unwrap().decode_utf16().unwrap(),
+                options: parser.Options_ref().unwrap().decode_utf16().unwrap(),
                 authentication_level: parser.AuthenticationLevel().unwrap(),
                 authentication_service: parser.AuthenticationService().unwrap(),
                 impersonation_level: parser.ImpersonationLevel().unwrap(),
@@ -1702,11 +1710,15 @@ fn preflight_process(events: &[CapturedEvent]) {
     let s_elevation: u32 = sp.ProcessTokenElevationType().unwrap();
     let s_elevated: u32 = sp.ProcessTokenIsElevated().unwrap();
     let s_sid = format!("{}", sp.MandatoryLabel().unwrap());
-    let s_image = sp.ImageName().unwrap();
+    let s_image = sp.ImageName_ref().unwrap().decode_utf16().unwrap();
     let s_checksum: u32 = sp.ImageChecksum().unwrap();
     let s_tds: u32 = sp.TimeDateStamp().unwrap();
-    let s_pkg_full = sp.PackageFullName().unwrap();
-    let s_pkg_rel_app = sp.PackageRelativeAppId().unwrap();
+    let s_pkg_full = sp.PackageFullName_ref().unwrap().decode_utf16().unwrap();
+    let s_pkg_rel_app = sp
+        .PackageRelativeAppId_ref()
+        .unwrap()
+        .decode_utf16()
+        .unwrap();
     let s_mitigations: u32 = sp.SecurityMitigations().unwrap();
 
     // etw-rs get parser
@@ -1971,7 +1983,7 @@ fn preflight_file(events: &[CapturedEvent]) {
     let s_create_options: u32 = sp.CreateOptions().unwrap();
     let s_create_attributes: u32 = sp.CreateAttributes().unwrap();
     let s_share_access: u32 = sp.ShareAccess().unwrap();
-    let s_file_name = sp.FileName().unwrap();
+    let s_file_name = sp.FileName_ref().unwrap().decode_utf16().unwrap();
 
     // etw-rs get parser
     let record = event.as_event_record();
@@ -2055,8 +2067,8 @@ fn preflight_registry(events: &[CapturedEvent]) {
     let s_key_object: usize = sp.KeyObject().unwrap();
     let s_status: u32 = sp.Status().unwrap();
     let s_disposition: u32 = sp.Disposition().unwrap();
-    let s_base_name = sp.BaseName().unwrap();
-    let s_relative_name = sp.RelativeName().unwrap();
+    let s_base_name = sp.BaseName_ref().unwrap().decode_utf16().unwrap();
+    let s_relative_name = sp.RelativeName_ref().unwrap().decode_utf16().unwrap();
 
     // etw-rs get parser
     let record = event.as_event_record();
@@ -2129,9 +2141,9 @@ fn preflight_rpc(events: &[CapturedEvent]) {
     let s_uuid = guid_to_u128(sp.InterfaceUuid().unwrap());
     let s_proc_num: u32 = sp.ProcNum().unwrap();
     let s_protocol: u32 = sp.Protocol().unwrap();
-    let s_network_address = sp.NetworkAddress().unwrap();
-    let s_endpoint = sp.Endpoint().unwrap();
-    let s_options = sp.Options().unwrap();
+    let s_network_address = sp.NetworkAddress_ref().unwrap().decode_utf16().unwrap();
+    let s_endpoint = sp.Endpoint_ref().unwrap().decode_utf16().unwrap();
+    let s_options = sp.Options_ref().unwrap().decode_utf16().unwrap();
     let s_auth_level: u32 = sp.AuthenticationLevel().unwrap();
     let s_auth_service: u32 = sp.AuthenticationService().unwrap();
     let s_impersonation: u32 = sp.ImpersonationLevel().unwrap();

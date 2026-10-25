@@ -430,7 +430,10 @@ trace.set_event_callback(|event, context| {
 ETW uses UTF-16 (wide strings) extensively. Design:
 - Zero-copy borrowed views (`WideStrRef`, `AnsiStrRef`) into the event buffer
 - Owned types (`WideString`, `AnsiString`) when the data must outlive the callback
-- Conversion to Rust `String` on request, via `FromProperty for String`
+- Wide strings convert to `OsString` by default — the static schema's owned accessor
+  returns it — because Windows permits unpaired surrogates that `String` cannot hold
+- Conversion to Rust `String` on request, via `FromProperty for String` or
+  `WideStrRef::decode_utf16`
 
 ### 5. Win32 Bindings
 

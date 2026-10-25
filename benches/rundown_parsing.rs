@@ -280,7 +280,7 @@ fn bench_etw_rs_static_parser(c: &mut Criterion) {
                 let parsed = ParsedFileRundownEtwRs {
                     timestamp: record.EventHeader.TimeStamp,
                     file_object: parser.FileObject().unwrap(),
-                    file_name: WideString::from(parser.FileName().unwrap()),
+                    file_name: WideString::from(parser.FileName_ref().unwrap()),
                 };
 
                 results.push(parsed);

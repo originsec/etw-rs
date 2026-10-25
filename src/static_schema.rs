@@ -61,11 +61,18 @@
 //!     let thread_id = parser.IssuingThreadId()?;
 //!     let options = parser.CreateOptions()?;
 //!
-//!     // Owned accessor — convenient, returns String
+//!     // Owned accessor — convenient and lossless, returns OsString
 //!     let filename = parser.FileName()?;
 //!
-//!     if filename.ends_with(".exe") {
-//!         println!("Thread {} created executable: {}", thread_id, filename);
+//!     if std::path::Path::new(&filename)
+//!         .extension()
+//!         .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+//!     {
+//!         println!(
+//!             "Thread {} created executable: {}",
+//!             thread_id,
+//!             filename.display()
+//!         );
 //!     }
 //!
 //!     // Zero-copy ref accessor — for hot paths, returns WideStrRef<'_>

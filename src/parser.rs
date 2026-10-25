@@ -1870,6 +1870,23 @@ impl FromProperty for AnsiString {
     }
 }
 
+impl FromProperty for std::ffi::OsString {
+    fn from_property(data: &[u8], in_type: TdhInType) -> Result<Self> {
+        match in_type {
+            TdhInType::UnicodeString
+            | TdhInType::NonNullTerminatedString
+            | TdhInType::CountedString
+            | TdhInType::ReversedCountedString
+            | TdhInType::ManifestCountedString => {
+                Ok(WideString::from_property(data, in_type)?.to_os_string())
+            }
+            _ => Err(Error::parse(format!(
+                "Cannot parse OsString from {in_type:?}"
+            ))),
+        }
+    }
+}
+
 impl FromProperty for String {
     fn from_property(data: &[u8], in_type: TdhInType) -> Result<Self> {
         match in_type {
@@ -2963,6 +2980,33 @@ mod tests {
         let result =
             String::from_property(&data, TdhInType::UnicodeString).expect("parse should succeed");
         assert_eq!(result, "Hi");
+    }
+
+    #[test]
+    fn test_os_string_from_property_keeps_lone_surrogate() {
+        use std::os::windows::ffi::OsStrExt;
+        // "H", lone high surrogate, null terminator
+        let data = [0x48, 0x00, 0x00, 0xD8, 0x00, 0x00];
+        assert!(String::from_property(&data, TdhInType::UnicodeString).is_err());
+        let result = std::ffi::OsString::from_property(&data, TdhInType::UnicodeString)
+            .expect("parse should succeed");
+        assert_eq!(result.encode_wide().collect::<Vec<_>>(), [0x48, 0xD800]);
+    }
+
+    #[test]
+    fn test_os_string_from_property_counted() {
+        // byte count 4, then "Hi"
+        let data = [0x04, 0x00, 0x48, 0x00, 0x69, 0x00];
+        for in_type in [TdhInType::CountedString, TdhInType::ManifestCountedString] {
+            let result =
+                std::ffi::OsString::from_property(&data, in_type).expect("parse should succeed");
+            assert_eq!(result, "Hi");
+        }
+    }
+
+    #[test]
+    fn test_os_string_from_property_rejects_ansi() {
+        assert!(std::ffi::OsString::from_property(b"Hi\0", TdhInType::AnsiString).is_err());
     }
 
     #[test]

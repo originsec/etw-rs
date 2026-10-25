@@ -1937,7 +1937,7 @@ fn is_variable_length_type(ty: &Type) -> bool {
 /// Returns true if this field generates a ref-type accessor that needs an owned counterpart.
 ///
 /// Ref-type accessors return borrowed types (`WideStrRef`, `AnsiStrRef`, `SidRef`, `&[u8]`).
-/// The owned counterpart returns the owned type (`String`, `AnsiString`, `Sid`, `Vec<u8>`).
+/// The owned counterpart returns the owned type (`OsString`, `String`, `Sid`, `Vec<u8>`).
 pub(crate) fn is_ref_accessor(field: &FieldDef) -> bool {
     // Binary fields accessed via length/fixed_length/count_bytes return &[u8]
     matches!(
@@ -1964,8 +1964,8 @@ fn gen_owned_wrapper(owned_name: &Ident, field: &FieldDef) -> Option<TokenStream
     if is_wide_string_type(&field.ty) || is_counted_wide_string_type(&field.ty) {
         Some(quote! {
             #[inline]
-            pub fn #owned_name(&mut self) -> ::etw::Result<String> {
-                self.#ref_name()?.decode_utf16()
+            pub fn #owned_name(&mut self) -> ::etw::Result<::std::ffi::OsString> {
+                Ok(self.#ref_name()?.to_os_string())
             }
         })
     } else if is_ansi_string_type(&field.ty) || is_counted_ansi_string_type(&field.ty) {
@@ -2010,11 +2010,9 @@ fn gen_owned_wrapper(owned_name: &Ident, field: &FieldDef) -> Option<TokenStream
 /// Used by multi-version trait generation to declare the owned method signature.
 /// Returns `None` for non-ref fields.
 pub(crate) fn owned_return_type(field: &FieldDef) -> Option<TokenStream2> {
-    if is_wide_string_type(&field.ty)
-        || is_counted_wide_string_type(&field.ty)
-        || is_ansi_string_type(&field.ty)
-        || is_counted_ansi_string_type(&field.ty)
-    {
+    if is_wide_string_type(&field.ty) || is_counted_wide_string_type(&field.ty) {
+        Some(quote! { ::std::ffi::OsString })
+    } else if is_ansi_string_type(&field.ty) || is_counted_ansi_string_type(&field.ty) {
         Some(quote! { String })
     } else if is_sid_type(&field.ty) || is_wbem_sid_type(&field.ty) {
         Some(quote! { ::etw::Sid })

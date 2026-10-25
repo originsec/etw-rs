@@ -82,7 +82,7 @@ struct SupersetField {
     /// ref-type fields, or the only accessor for non-ref fields).
     /// Stored as `syn::Type` so cross-version equality is structural, not textual.
     actual_ty: syn::Type,
-    /// Owned return type for ref-type fields (e.g., `String` for `WideStrRef`).
+    /// Owned return type for ref-type fields (e.g., `OsString` for `WideStrRef`).
     /// `None` for non-ref fields.
     owned_ty: Option<TokenStream2>,
     /// Which version numbers contain this field

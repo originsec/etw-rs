@@ -79,6 +79,12 @@ when it cannot start a session with an over-long name or log path, or cannot
 build the over-long directory tree. A green CI run does not prove those
 over-the-cap cases ran.
 
+The lib tests of `query_sessions`' growth paths (`src/session/enumerate.rs`) need
+more than one session in view, and a non-admin token's view is filtered — 2 of
+61 sessions on one host, sometimes 1. They skip only after failing *and*
+re-querying shows at most one visible, and never under `CI`, so `unit` stays
+runnable without Administrator.
+
 ## Conventions
 
 - `#[ignore = "slow"]` is the only ignore reason, and it means what it says:

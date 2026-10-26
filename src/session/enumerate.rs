@@ -380,6 +380,31 @@ fn session_properties(buffer: &QueryBuffer) -> Result<SessionProperties> {
 mod tests {
     use super::*;
 
+    /// Whether too few sessions are visible for the growth tests to mean anything,
+    /// in which case the caller skips.
+    ///
+    /// Both need more than one session in view, and a non-admin token's view is
+    /// filtered: measured at 2 of 61 on one host, and 1 when Visual Studio's
+    /// session was not running. With one visible, a one-buffer query simply fits.
+    /// `CI` runs elevated, where the view is never that small, so there a short
+    /// view panics instead — the rule `tests/common::skip_or_panic` applies.
+    #[expect(
+        clippy::print_stdout,
+        reason = "the skip line is the only report that the test's coverage was lost"
+    )]
+    fn too_few_sessions_visible(test: &str) -> bool {
+        let visible = query_sessions().expect("enumeration failed").len();
+        if visible > 1 {
+            return false;
+        }
+        assert!(
+            std::env::var_os("CI").is_none_or(|v| v.is_empty()),
+            "{test}: only {visible} ETW session(s) visible; CI runs elevated, so this is a defect"
+        );
+        println!("Skipping {test}: only {visible} ETW session(s) visible; needs Administrator.");
+        true
+    }
+
     /// The retry is the one branch `INITIAL_CAPACITY` is chosen to avoid: at 64
     /// buffers it takes more concurrent sessions than a normal machine runs to
     /// reach, so it would never execute under test. Starting at a single buffer
@@ -393,6 +418,11 @@ mod tests {
     #[cfg(not(miri))] // QueryAllTracesW is a Win32 call, unavailable under Miri.
     fn short_first_attempt_retries_instead_of_truncating() {
         let sessions = query_sessions_from(1).expect("enumeration failed");
+        if sessions.len() <= 1
+            && too_few_sessions_visible("short_first_attempt_retries_instead_of_truncating")
+        {
+            return;
+        }
 
         assert!(
             sessions.len() > 1,
@@ -419,8 +449,19 @@ mod tests {
     #[test]
     #[cfg(not(miri))] // QueryAllTracesW is a Win32 call, unavailable under Miri.
     fn a_count_past_the_ceiling_is_reported_as_our_limit() {
-        let error = query_sessions_bounded(1, 1)
-            .expect_err("a 1-session ceiling admitted a machine running more than one");
+        let error = match query_sessions_bounded(1, 1) {
+            Err(error) => error,
+            Ok(_)
+                if too_few_sessions_visible(
+                    "a_count_past_the_ceiling_is_reported_as_our_limit",
+                ) =>
+            {
+                return;
+            }
+            Ok(sessions) => {
+                panic!("a 1-session ceiling admitted a machine running more than one: {sessions:?}")
+            }
+        };
 
         // Both fields, not just the variant: `operation` names what gave up and
         // `limit` is the number a reader has to raise, so a ceiling reported

@@ -87,14 +87,17 @@ fn a_running_system_logger_session_is_enumerated() {
     let mut trace = Trace::new(&name).expect("failed to create trace");
     trace.set_events(&[PERF_PROCESS]);
 
-    if let Err(e) = trace.start() {
+    let started = trace.start();
+    if let Err(e) = &started {
         // Context, not necessarily cause — an unprivileged run fails here with
         // ERROR_ACCESS_DENIED while slots are free. Print the error first so the
         // slot census cannot be misread as the explanation.
         println!("system-logger start failed: {e}");
         println!("slot census at the time of failure:");
         report_system_loggers();
-        panic!("system-logger start failed: {e}");
+    }
+    if common::skip_or_panic("system-logger start", started).is_none() {
+        return;
     }
 
     // The session we just started must appear in the enumeration, which is the

@@ -680,7 +680,7 @@ impl std::fmt::Debug for ParserCache {
 ///
 /// `W` is a const parameter so each comparison is a fixed-size array equality,
 /// which LLVM lowers inline instead of calling `memcmp`: an integer compare up to
-/// `W == 8`, and a single SIMD compare at `W == 16` (measured at roughly 0.4ns).
+/// `W == 8`, and a single SIMD compare at `W == 16`.
 #[inline]
 fn ends_equal<const W: usize>(lhs: &[u8], rhs: &[u8]) -> bool {
     let (Some(left_head), Some(left_tail), Some(right_head), Some(right_tail)) = (
@@ -703,20 +703,16 @@ fn ends_equal<const W: usize>(lhs: &[u8], rhs: &[u8]) -> bool {
 /// `memcmp` only when the length is a compile-time constant, and these lengths
 /// are not, so on MSVC the comparison becomes an indirect call into
 /// `vcruntime140.dll` through the import table. Property names are short enough
-/// that the call costs more than the bytes it compares: measured over real ETW
-/// names, 4.4ns for `==` against 1.5ns for this.
+/// that the call costs more than the bytes it compares.
 ///
-/// The arms cover 0..=32 bytes, which is every name observed across the
-/// generated schemas in this repository -- 52 distinct names spanning 3 to 27
-/// bytes, none longer. Anything past that keeps the libcall.
+/// The arms cover 0..=32 bytes, which spans every property name in the generated
+/// schemas in this repository. Anything past that keeps the libcall.
 ///
 /// The 17..=32 arm is not optional padding. Without it, a name in that range
-/// pays the length dispatch *and then* the libcall anyway, which measured 7.1ns
-/// against 5.9ns for plain `==` -- slower than not optimising at all. 21% of the
-/// observed names fall in that range, `ParentProcessSequenceNumber` and
-/// `ProcessTokenElevationType` among them, so the arm converts a regression on a
-/// fifth of all lookups into a 3x gain. Its 16-byte chunks compare as one SSE
-/// operation (~0.4ns measured), and adding it cost the shorter names nothing.
+/// pays the length dispatch *and then* the libcall anyway -- slower than plain
+/// `==`, not faster. Names that long are common (`ParentProcessSequenceNumber`,
+/// `ProcessTokenElevationType`), and the arm's 16-byte chunks compare as one SSE
+/// operation each, so it costs the shorter names nothing.
 #[inline]
 fn names_equal(lhs: &str, rhs: &str) -> bool {
     let (left, right) = (lhs.as_bytes(), rhs.as_bytes());
@@ -2755,7 +2751,7 @@ mod tests {
         assert_eq!(result.raw(), ticks);
         assert_eq!(result.as_unix_ms(), 1000); // 1 second = 1000ms
 
-        // UInt64 is no longer accepted — use FileTime explicitly
+        // UInt64 is rejected: a FILETIME must be declared as FileTime
         assert!(Timestamp::from_property(&data, TdhInType::UInt64, TdhOutType::Null).is_err());
     }
 
@@ -3604,11 +3600,9 @@ mod tests {
 //
 // A `MockSchemaBuilder` schema and a hand-encoded payload are written from one
 // understanding of the wire format, so a test asserting the two against each other
-// cannot fail when that understanding is wrong. That is how the `CountedString`
-// byte-count bug survived a green suite. The property-offset claims that used to
-// live here are now made against real TDH schemas in
-// `tests/differential_offline.rs`, where TDH supplies the expected answer and a
-// trailing sentinel catches drift.
+// cannot fail when that understanding is wrong. Property-offset claims are
+// therefore made against real TDH schemas in `tests/differential_offline.rs`,
+// where TDH supplies the expected answer and a trailing sentinel catches drift.
 //
 // What remains is deliberate, in four groups:
 //

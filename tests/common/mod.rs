@@ -42,8 +42,8 @@ fn env_flag(name: &str) -> bool {
 /// or enabling a kernel provider without Administrator (or Performance Log
 /// Users) rights, and `ERROR_NOT_ALL_ASSIGNED` (1300) when a required token
 /// privilege — e.g. `SeSystemProfilePrivilege` for PMC/LBR profiling — is not
-/// held. Both codes are observed exactly (not guessed): see the per-test panic
-/// evidence that motivated this helper.
+/// held. Both are the codes ETW actually returns, not inferred from
+/// documentation.
 ///
 /// The returned code is the only trustworthy signal that the capability is
 /// absent. An elevated-looking token is not sufficient: a Safer-restricted
@@ -92,7 +92,7 @@ pub fn skip_or_panic<T>(label: &str, result: Result<T, Error>) -> Option<T> {
 /// a manifest provider, so no system-logger slot is involved — which is the
 /// narrowest thing that separates a host able to run these tests from one that
 /// merely looks able. Creating a session is not that thing, and neither is the
-/// elevation flag. Measured on four token shapes:
+/// elevation flag. By token shape:
 ///
 /// | token | `is_elevated()` | realtime session | enable kernel provider |
 /// |---|---|---|---|
@@ -102,7 +102,7 @@ pub fn skip_or_panic<T>(label: &str, result: Result<T, Error>) -> Option<T> {
 /// | plain unprivileged | false | denied | denied |
 ///
 /// `Performance Log Users` grants session creation and user-mode providers — the
-/// DNS-Client test really does pass on that host — but not kernel providers and
+/// DNS-Client test can run there — but not kernel providers and
 /// not `MSNT_SystemTrace`, so the great majority of this suite still skips
 /// there. A session-creation probe passes on those middle rows and is therefore
 /// close to useless; the elevation flag is worse still, since a restricted token

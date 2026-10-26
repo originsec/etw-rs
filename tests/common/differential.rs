@@ -76,14 +76,14 @@ pub const FLAG_64_BIT: u16 = 0x0200;
 /// No offline fixture uses this, and one cannot usefully: `TdhLoadManifest` resolves
 /// the manifest in *this* process, so `win:Pointer` gets a concrete declared length
 /// of 8 baked into the schema. Setting the 32-bit header flag does not undo that —
-/// measured, with the flag set and a 4-byte pointer payload, etw-rs and TDH *agree*
-/// on reading 8 bytes and both then run past the end. So the flag changes nothing
+/// with the flag set and a 4-byte pointer payload, etw-rs and TDH *agree* on
+/// reading 8 bytes and both then run past the end. So the flag changes nothing
 /// here and a 32-bit fixture would only be testing the harness.
 ///
 /// Real 32-bit pointer coverage belongs where the record genuinely comes from a
 /// 32-bit process: `tests/32bit_events.rs`, and `tests/mixed_bitness_events.rs`,
-/// which covers the schema-cache key that once let the first bitness seen decide
-/// the offsets for both.
+/// which checks that the schema cache is keyed on bitness, so the first bitness
+/// seen cannot decide the offsets for both.
 pub const FLAG_32_BIT: u16 = 0x0040;
 
 /// Loads the fixture manifest into this process, once.

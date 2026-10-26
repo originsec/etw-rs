@@ -24,16 +24,15 @@ use serial_test::serial;
 /// is what misleads: it reads as "2 still free" at the exact moment a start has
 /// just failed for want of a slot.
 ///
-/// Measured on Windows 11: with 6 ordinary system loggers running, a seventh
-/// failed with `ERROR_NO_SYSTEM_RESOURCES`.
+/// With 6 ordinary system loggers running, a seventh fails with
+/// `ERROR_NO_SYSTEM_RESOURCES`.
 const USABLE_SYSTEM_LOGGER_SLOTS: usize = 6;
 
 /// The two loggers with a slot of their own — `KERNEL_LOGGER_NAMEW` and
 /// `GLOBAL_LOGGER_NAMEW` in `evntrace.h`.
 ///
-/// The reservation is real and is not drawn from the 6: at the ceiling above,
-/// where an ordinary start failed, `NT Kernel Logger` started in the same
-/// instant and took the total to 7.
+/// The reservation is not drawn from the 6: with the ordinary slots full,
+/// `NT Kernel Logger` still starts, taking the total to 7.
 ///
 /// It has to be excluded by name because nothing else distinguishes it. A
 /// running `NT Kernel Logger` enumerates like any other session and sets the
@@ -131,12 +130,12 @@ fn a_running_system_logger_session_is_enumerated() {
 // Nothing in the reply can be used to detect that after the fact. `LogFileMode`
 // carries no bit that marks a session as file-backed: sequential mode is the
 // zero value, and a session may be real-time *and* write a file
-// (`LogFileMode == 0x00400101` was observed doing exactly that), so neither a
+// (`LogFileMode == 0x00400101` is one such session), so neither a
 // file-mode bit nor the absence of `REAL_TIME` separates the two cases. A
 // sentinel pre-fill cannot either, because ETW writes nothing at all — not even
 // a terminator — for a session that genuinely has no log file.
 //
-// So the caps are measured, and these tests exist to fail the moment a Windows
+// The caps are undocumented, so these tests exist to fail the moment a Windows
 // release moves them. Each asks ETW to store one character *past* the cap and
 // requires the stored value back at exactly the cap: if the cap rises, the value
 // comes back longer, or vanishes because it no longer fits, and either way this
@@ -398,9 +397,9 @@ fn enumerates_well_known_sessions() {
     );
 
     // Only when elevated. QueryAllTracesW returns a privilege-filtered view, and
-    // the filtering is not intuitive: measured on one machine, an unelevated
-    // caller saw 34 sessions against 46 elevated, with `EventLog-Application`
-    // hidden while `Eventlog-Security` stayed visible. Asserting these names
+    // the filtering is not intuitive: it can hide most sessions from an
+    // unelevated caller, and does not follow naming — `EventLog-Application` can
+    // be hidden while `Eventlog-Security` stays visible. Asserting these names
     // unconditionally would fail an unelevated run for reasons that say nothing
     // about the enumeration itself.
     //

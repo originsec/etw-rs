@@ -802,9 +802,8 @@ impl<'a> WideStrRef<'a> {
                 s.push(c.unwrap_or(char::REPLACEMENT_CHARACTER));
             }
         } else {
-            // Fallback: unaligned data — reconstruct u16 values from byte pairs.
-            // Also avoids the intermediate Vec<u16> that the old `from_utf16_lossy` path
-            // required.
+            // Fallback: unaligned data — reconstruct u16 values from byte pairs,
+            // without collecting them into an intermediate Vec<u16>.
             for c in char::decode_utf16(
                 self.data
                     .as_chunks::<2>()
@@ -1158,9 +1157,8 @@ impl<'a> AnsiStrRef<'a> {
 
         // UTF-8 needs no code-page table, so skip the round trip through UTF-16.
         // `from_utf8` accepts exactly what `MultiByteToWideChar(CP_UTF8,
-        // MB_ERR_INVALID_CHARS)` does and decodes it identically — measured over
-        // every input of up to 3 bytes, every 4-byte input led by 0xF0-0xFF, and
-        // 2M longer ones — and Win32 rejects with this same error.
+        // MB_ERR_INVALID_CHARS)` does and decodes it identically, and Win32 rejects
+        // with this same error.
         if codepage == CP_UTF8 {
             return std::str::from_utf8(self.data)
                 .map(str::to_owned)
@@ -1261,11 +1259,11 @@ impl Eq for AnsiStrRef<'_> {}
 /// inconsistent with [`PartialEq`] against another `AnsiStrRef`: that compares
 /// bytes, while `to_string_lossy` tries UTF-8 and falls back to CP1252, so two
 /// different byte strings can decode to the same text. `é` is `C3 A9` in UTF-8
-/// and `E9` in CP1252 — decoding made both equal to `"é"` while they stayed
+/// and `E9` in CP1252 — decoding would make both equal to `"é"` while they stay
 /// unequal to each other, which is not an equivalence relation, and `Eq` is
 /// implemented for this type.
 ///
-/// The cost is that genuinely CP1252-encoded data no longer equals its decoded
+/// The cost is that genuinely CP1252-encoded data does not equal its decoded
 /// form. Decode it explicitly with [`decode()`](AnsiStrRef::decode) and compare
 /// the `String` when that is what you mean, which also makes the code page a
 /// choice rather than a guess.
@@ -3186,9 +3184,9 @@ mod tests {
     #[test]
     fn wide_string_partial_eq_str_rejects_invalid_utf16() {
         // A lone high surrogate. `to_string_lossy` renders it as the replacement
-        // character, so under the old comparison it — and every other malformed
-        // payload — equalled a string of just that character, while all of them
-        // compared unequal to each other.
+        // character, so a comparison through it would make this — and every other
+        // malformed payload — equal a string of just that character, while all of
+        // them compare unequal to each other.
         let lone_surrogate = WideString::from_bytes(&[0x00, 0xD8]);
         assert!(
             lone_surrogate != *"\u{FFFD}",

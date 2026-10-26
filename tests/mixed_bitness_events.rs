@@ -29,7 +29,7 @@
 //!
 //! An offline fixture cannot substitute. TDH ignores
 //! `EVENT_HEADER_FLAG_32_BIT_HEADER` on a synthesised record even for a
-//! registered provider -- measured: it reads 8-byte pointers regardless, then
+//! registered provider -- it reads 8-byte pointers regardless, then
 //! runs off the end of a 4-byte-pointer payload. So TDH is only a usable oracle
 //! for 32-bit layouts when the record genuinely came from a 32-bit process.
 //!

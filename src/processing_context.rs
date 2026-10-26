@@ -61,9 +61,9 @@ use windows_sys::Win32::{
 /// an event belongs to, straight from the header with no TDH call, so one 16-bit
 /// slot carries whichever applies.
 ///
-/// Measured over live traffic: every classic-flagged event had `Id == 0` and
-/// every non-classic event `Id != 0`, with no exceptions, so collapsing the two
-/// discriminators into one slot is lossless.
+/// A classic-flagged event carries `Id == 0` and a non-classic manifest event a
+/// non-zero `Id`, so collapsing the two discriminators into one slot is
+/// lossless.
 ///
 /// Channel is intentionally excluded: TDH schemas are identical regardless of
 /// channel.
@@ -75,9 +75,8 @@ use windows_sys::Win32::{
 /// offset table unrepresentable rather than something each size computation has
 /// to remember to avoid.
 ///
-/// TraceLogging is the exception to the measurement above: non-classic with
-/// `Id == 0`, so its events share a slot and need a cache keyed on the schema
-/// blob.
+/// TraceLogging is the exception: non-classic with `Id == 0`, so its events
+/// share a slot and need a cache keyed on the schema blob.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SchemaKey {
@@ -92,13 +91,10 @@ struct SchemaKey {
 /// change how an event decodes, plus the one that selects its discriminator.
 ///
 /// - `32_BIT_HEADER` / `64_BIT_HEADER` — pointer size, which sets the width of `Pointer` and
-///   `SizeT` properties and therefore every offset after them. This is the distinction the key
-///   previously missed. Both bits are included so the key mirrors what the header states, rather
-///   than relying on the absence of one implying the other.
+///   `SizeT` properties and therefore every offset after them. Both bits are included so the key
+///   mirrors what the header states, rather than relying on the absence of one implying the other.
 /// - `CLASSIC_HEADER` — manifest events are identified by provider + Id + Version, classic MOF
-///   events by opcode. Measured across NT Kernel Logger, manifest, stack-trace and TraceLogging
-///   sessions: every classic-flagged event had `Id == 0` and every non-classic event `Id != 0`,
-///   without exception.
+///   events by opcode, so this selects which of the two the shared discriminator slot holds.
 ///
 /// No other flag bit distinguishes schemas that reach this cache, so none are
 /// keyed.
@@ -173,12 +169,12 @@ pub(crate) const fn pointer_size_from_flags(flags: u32) -> u8 {
 /// FxHash implementation for SchemaKey.
 ///
 /// Hashes the GUID as u128 plus the packed event key u32.
-/// Using `write_u128()` is 2x faster than `write()` with a byte slice because
-/// it avoids the `hash_bytes()` compression step and uses direct bit operations.
+/// Using `write_u128()` is faster than `write()` with a byte slice because it
+/// avoids the `hash_bytes()` compression step and uses direct bit operations.
 impl Hash for SchemaKey {
     #[inline]
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Hash GUID as u128 (2x faster than write() with byte slice)
+        // Hash GUID as u128 (faster than write() with a byte slice)
         // SAFETY: GUID is 16 bytes, repr(C), and we use read_unaligned since GUID is only 4-byte
         // aligned
         let guid_u128 =

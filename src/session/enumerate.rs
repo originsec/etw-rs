@@ -16,8 +16,8 @@ use windows_sys::Win32::{
 
 /// Sessions to size the query buffer for on the first attempt.
 ///
-/// Windows has historically capped concurrent sessions at 64. The value is only
-/// a starting guess: a short count is retried at the size the OS asks for, so a
+/// 64 matches Windows' long-standing cap on concurrent sessions. The value is
+/// only a starting guess: a short count is retried at the size the OS asks for, so a
 /// raised cap costs one extra call rather than truncated results.
 const INITIAL_CAPACITY: usize = 64;
 
@@ -40,29 +40,19 @@ const MAX_CAPACITY: usize = 1024;
 /// and it echoes back the `Wnode.BufferSize` and offsets it was given, so
 /// nothing in the reply distinguishes "no name" from "no room". `LogFileMode`
 /// cannot stand in either — see [`LOG_FILE_NAME_UNITS`]. Sizing correctly is the
-/// only defence, which is why these are measured rather than guessed.
+/// only defence.
 ///
-/// # Measurement
-///
-/// Taken by driving `StartTraceW` and `QueryAllTracesW` directly — not `logman`,
-/// which reports success for lengths ETW then silently stores differently, and
-/// which refuses long paths its own `MAX_PATH` handling rejects before ETW ever
-/// sees them. Passing the path with a `\\?\` prefix, on Windows 11:
-///
-/// | field         | passed | stored |
-/// |---------------|--------|--------|
-/// | logger name   | 1024   | 1024   |
-/// | logger name   | 1040   | 1024   |
-/// | log file name | 1040   | 1040   |
-/// | log file name | 1041   | 1040   |
-///
-/// So ETW caps the two at 1024 and 1040 characters and truncates beyond that.
-/// `MAX_PATH` — the sizing the ETW samples use — is nowhere near either, and
-/// neither is a single round 1024 for both.
+/// ETW stores at most 1024 characters of a logger name and 1040 of a log file
+/// path, truncating beyond that. `MAX_PATH` — the sizing the ETW samples use — is
+/// nowhere near either, and neither is a single round 1024 for both. The caps are
+/// undocumented; `tests/session_enumeration.rs` fails if a Windows release moves
+/// them. Re-measure with `StartTraceW` and `QueryAllTracesW` directly, not
+/// `logman`, which mis-reports long names and rejects long paths before ETW sees
+/// them.
 const LOGGER_NAME_UNITS: usize = 1025;
 
 /// Longest log file path ETW will store, plus a terminator. See
-/// [`LOGGER_NAME_UNITS`] for how both were measured and why they must be exact.
+/// [`LOGGER_NAME_UNITS`] for why both must be exact.
 ///
 /// Note this is *not* the filesystem's limit. ETW will accept and store a path
 /// well past `MAX_PATH` when given one with a `\\?\` prefix, so a caller cannot
@@ -160,11 +150,10 @@ pub struct SessionProperties {
     ///
     /// That rewrite makes the copy safe to hand to a Win32 trace API, not useful
     /// to. ETW insists on somewhere to write the two names back, so a bare
-    /// struct with no trailing space is rejected: passing this copy to
-    /// `ControlTraceW` was measured returning `ERROR_MORE_DATA` (234) without
-    /// touching the session. To control a session found here, build a buffer
-    /// with name space after it — as [`Trace`] does — and address it by
-    /// [`name`](Self::name).
+    /// struct with no trailing space is rejected: `ControlTraceW` returns
+    /// `ERROR_MORE_DATA` (234) for this copy without touching the session. To control a session
+    /// found here, build a buffer with name space after it — as [`Trace`] does — and address
+    /// it by [`name`](Self::name).
     ///
     /// [`Trace`]: crate::Trace
     ///
@@ -205,9 +194,9 @@ impl std::fmt::Debug for SessionProperties {
 /// Every ETW session currently running on the machine.
 ///
 /// Requires no privilege to call, but returns a privilege-filtered view, and the
-/// filtering is not intuitive: measured on one machine, an unelevated caller saw
-/// 34 sessions against 46 elevated, with `EventLog-Application` hidden while
-/// `Eventlog-Security` remained visible. A short list is therefore not evidence
+/// filtering is not intuitive: it can hide most sessions from an unelevated
+/// caller, and does not follow naming — `EventLog-Application` can be hidden
+/// while `Eventlog-Security` stays visible. A short list is therefore not evidence
 /// that the machine is idle, and an absent name is not evidence the session is
 /// not running.
 ///
@@ -384,8 +373,8 @@ mod tests {
     /// in which case the caller skips.
     ///
     /// Both need more than one session in view, and a non-admin token's view is
-    /// filtered: measured at 2 of 61 on one host, and 1 when Visual Studio's
-    /// session was not running. With one visible, a one-buffer query simply fits.
+    /// filtered, sometimes down to a single session. With one visible, a
+    /// one-buffer query simply fits.
     /// `CI` runs elevated, where the view is never that small, so there a short
     /// view panics instead — the rule `tests/common::skip_or_panic` applies.
     #[expect(

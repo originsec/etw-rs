@@ -2763,8 +2763,8 @@ fn bench_get_five_fields(c: &mut Criterion) {
     });
 }
 
-// Note: TdhGetProperty for 5 fields can be estimated from existing 4-field benchmark:
-// 4 fields = 2830ns, so 5 fields ≈ 3538ns (2830 × 5/4)
+// TdhGetProperty is not benchmarked at 5 fields: its cost scales linearly with
+// field count, so the 4-field benchmark × 5/4 estimates it.
 
 // =============================================================================
 // Main

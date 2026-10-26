@@ -599,32 +599,18 @@ impl std::fmt::Display for NameSuffix {
 ///
 /// # Width
 ///
-/// `Error` is 48 bytes, so every `Result<T, Error>` in the crate is at least
-/// that. Do not shrink it for performance: measured, the width does not matter.
-///
-/// A padding variant was used to widen `Error` from 40 to 128 bytes — 3.2x —
-/// leaving everything else identical, and the two builds were run round-robin
-/// (alternating, so thermal drift hits both arms equally; comparing sequential
-/// runs on a laptop cannot resolve this) over the 2836-event registry capture:
-///
-/// ```text
-/// etw-rs-get          40B: median 1350.7us  min 1284.9us
-///                    128B: median 1329.0us  min 1284.0us
-/// etw-rs-get-hinted   40B: median  852.6us  min  807.0us
-///                    128B: median  833.3us  min  807.2us
-/// ```
-///
-/// The minima — the least contaminated runs — match to within 0.1%. Each
+/// `Error`'s width is the minimum width of every `Result<T, Error>` in the
+/// crate. Do not shrink it for performance: it does not affect throughput. Each
 /// accessor does hundreds of nanoseconds of real work (hash lookup, offset
 /// computation, UTF-16 to UTF-8 transcoding), against which a wider return slot
-/// is nothing, and on x86-64 Windows every one of these sizes is returned
-/// through a hidden pointer anyway, so no size crosses a calling-convention
-/// boundary. Boxing variants, or moving to a `Box<ErrorKind>` newtype, buys
-/// nothing here.
+/// is nothing, and on x86-64 Windows every `Result<T, Error>` — wider than the
+/// 8 bytes a register returns — goes back through a hidden pointer whatever its
+/// size, so no width crosses a calling-convention boundary. Boxing variants, or moving to a
+/// `Box<ErrorKind>` newtype, buys nothing here.
 ///
 /// What *is* worth keeping narrow is anything genuinely large:
 /// [`Error::ParseError`] and [`Error::SchemaValidationError`] box their oversized
-/// payloads so a 64-byte `SchemaMismatch` does not set the width for everyone.
+/// payloads so a large `SchemaMismatch` does not set the width for everyone.
 /// `clippy::result_large_err` (enabled here via `clippy::all`, threshold 128
 /// bytes) is the backstop, and it is silent at the current size.
 #[derive(thiserror::Error)]
@@ -658,10 +644,9 @@ pub enum Error {
         /// the common `None` costs a pointer instead of carrying a
         /// [`ParseLocation`] inline.
         ///
-        /// Not a speed optimisation — see the note on [`Error`], which measured
-        /// `Result` width to be free on the parse path. Keep the box because it
-        /// keeps the variant tidy, not in the belief that unboxing would cost
-        /// throughput.
+        /// Not a speed optimisation: `Result` width is free on the parse path
+        /// (see the note on [`Error`]). Keep the box because it keeps the variant
+        /// tidy, not in the belief that unboxing would cost throughput.
         location: Option<Box<ParseLocation>>,
         /// What was wrong with the bytes.
         message: std::borrow::Cow<'static, str>,
@@ -761,9 +746,8 @@ pub enum Error {
 /// The byte-level parsers are event-agnostic and carry no location at all —
 /// [`Error::ParseError`]'s `location` is `None` for them. When a property
 /// accessor attaches one on the way out, both parts are known, so the fields
-/// are plain rather than optional. Carried as fields so the identity is not
-/// fused into the message, which is what made the old payload impossible to
-/// read back.
+/// are plain rather than optional. Carried as fields rather than fused into the
+/// message, so a caller can read the identity back instead of parsing text.
 #[derive(Debug, Clone)]
 pub struct ParseLocation {
     /// Identity of the event being parsed.
@@ -1298,10 +1282,10 @@ mod tests {
     /// that pushes `Error` past that turns every `Result<T, Error>` in the crate
     /// into a lint failure under CI's `-D warnings`.
     ///
-    /// Deliberately not pinned to the current 48 bytes. Width was measured to be
-    /// free on the parse path (see the `# Width` note on [`Error`]), so a snug
-    /// bound would only manufacture failures for changes that cost nothing;
-    /// this asserts the limit that has a real consequence.
+    /// Deliberately not pinned to the current width. Width is free on the parse
+    /// path (see the `# Width` note on [`Error`]), so a snug bound would only
+    /// manufacture failures for changes that cost nothing; this asserts the limit
+    /// that has a real consequence.
     #[test]
     fn test_error_stays_under_result_large_err_threshold() {
         assert!(

@@ -36,7 +36,7 @@ and pass without the variable.
 
 The guard probes **enabling a kernel provider**, because that is the narrowest
 capability separating a host that can run these tests from one that only looks
-able. Measured on four token shapes:
+able. By token shape:
 
 | token | `is_elevated()` | realtime session | enable kernel provider |
 |---|---|---|---|
@@ -46,8 +46,8 @@ able. Measured on four token shapes:
 | plain unprivileged | false | denied | denied |
 
 `Performance Log Users` is worth understanding, since it is easy to assume it is
-enough. It grants session creation and user-mode providers — `dns_client` really
-does pass on such a host — but **not** kernel providers and not
+enough. It grants session creation and user-mode providers — `dns_client` can run
+on such a host — but **not** kernel providers and not
 `MSNT_SystemTrace`, so `kernel_process`, `field_types`, `kernel_file` and every
 system-logger suite still skip. A probe that only created a session would pass on
 that host and prove nothing; the elevation flag is worse, since a restricted token
@@ -80,8 +80,8 @@ build the over-long directory tree. A green CI run does not prove those
 over-the-cap cases ran.
 
 The lib tests of `query_sessions`' growth paths (`src/session/enumerate.rs`) need
-more than one session in view, and a non-admin token's view is filtered — 2 of
-61 sessions on one host, sometimes 1. They skip only after failing *and*
+more than one session in view, and a non-admin token's view is filtered,
+sometimes down to a single session. They skip only after failing *and*
 re-querying shows at most one visible, and never under `CI`, so `unit` stays
 runnable without Administrator.
 
@@ -289,8 +289,8 @@ data, or live TDH metadata without a session.
 >
 > **32-bit pointers** are not covered offline: `TdhLoadManifest` resolves the
 > manifest in the test process, so `win:Pointer` gets a declared length of 8 baked
-> into the schema, and setting the 32-bit header flag does not undo it (measured:
-> etw-rs and TDH *agree* on reading 8 bytes). Real coverage lives in
+> into the schema, and setting the 32-bit header flag does not undo it (etw-rs
+> and TDH *agree* on reading 8 bytes). Real coverage lives in
 > `tests/32bit_events.rs` and, more thoroughly, in `tests/mixed_bitness_events.rs`.
 
 | File | What It Tests |

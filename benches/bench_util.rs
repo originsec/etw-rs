@@ -32,15 +32,10 @@ struct CpuSetEntry {
 /// throttled process is slow even on a performance core. On non-hybrid machines, where
 /// every core shares one class, only the throttling opt-out applies.
 ///
-/// A hard mask is deliberate. This previously called `SetProcessDefaultCpuSets`,
-/// which is only a scheduling *hint*: the kernel may ignore it, and the old code
-/// printed a reassuring "pinned to N P-cores" either way, so a benchmark that had
-/// been scheduled elsewhere still reported its figures as if pinned.
-///
-/// Measured on an Intel Core Ultra 7 268V, `process_start/etw-rs-static` launched
-/// from background tooling: 723ns/event with the old hint, roughly 650 with a hard
-/// mask, and about 287 once [`disable_power_throttling`] is applied as well. The
-/// mask is the smaller half of that; do not remove either.
+/// A hard mask is deliberate: `SetProcessDefaultCpuSets` is only a scheduling
+/// *hint* the kernel may ignore, so a benchmark could run elsewhere while still
+/// reporting its figures as pinned. The mask is the smaller of the two effects —
+/// [`disable_power_throttling`] is the larger — but do not remove either.
 ///
 /// # Panics
 ///
@@ -150,18 +145,12 @@ pub fn pin_to_performance_cores() {
 /// Opt this process out of Windows execution-speed power throttling.
 ///
 /// A benchmark launched from background tooling starts with `ControlMask == 0`, i.e.
-/// the system decides whether to throttle it, and measurably does. Opting out is worth
-/// more than the core pinning above: an ABBA-paired comparison of two builds differing
-/// only in this call measured **-55.04% +/- 0.46%** over 12 pairs on
-/// `process_start/etw-rs-static` (`benches/round_robin.py`).
+/// the system decides whether to throttle it, and it does. Opting out is worth more
+/// than the core pinning above.
 ///
-/// The mechanism behind that is *not* established. Sampling the benchmark process from
-/// outside put its effective clock at 3215MHz throttled against 4064MHz not, which is
-/// only 1.26x and cannot by itself explain a 2.19x change in wall time — the throttled
-/// run also retires the same work in roughly 1.7x the cycles. That external sampling is
-/// confounded by criterion's parallel analysis phase, so treat both figures as
-/// indicative. What is solid is the effect and its sign; do not repeat a tidier
-/// explanation than the measurements support.
+/// The mechanism behind that is *not* established: the lower clock of a throttled
+/// process does not by itself account for the slowdown. What is solid is the effect
+/// and its sign; do not document a tidier explanation than that.
 ///
 /// Raising the process priority class lifts it too, but that is a blunt instrument that
 /// changes how the benchmark competes with every other process on the machine.

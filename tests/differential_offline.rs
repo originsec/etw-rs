@@ -517,8 +517,8 @@ fn all_records() -> Vec<Fixture> {
 
 /// Every property of every fixture must decode to exactly the bytes TDH gives.
 ///
-/// The comparison is byte-for-byte with no per-type allowances. That is measured, not
-/// assumed: etw-rs and TDH agree on the extent of every shape here, including the NUL
+/// The comparison is byte-for-byte with no per-type allowances: etw-rs and TDH
+/// agree on the extent of every shape here, including the NUL
 /// of a `win:UnicodeString` and the sub-authority tail of a `win:SID`. A future type
 /// needing an allowance is a finding to understand, not a tolerance to widen.
 #[test]

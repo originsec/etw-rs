@@ -158,20 +158,20 @@ EVENT_RECORD → schema → property lookup → parse by type → typed result
 ## Comparing two builds
 
 Running one build after the other cannot resolve a small parser change: a single
-arm's per-run median drifts 5–13% between runs, and the drift is on a seconds
-timescale, so pairing both arms inside one process does not help either. Use
-`round_robin.py`, which runs a paired design:
+arm's per-run median drifts by several percent between runs, and the drift is on
+a seconds timescale, so pairing both arms inside one process does not help
+either. Use `round_robin.py`, which runs a paired design:
 
 - **ABBA ordering.** Base-then-candidate on odd rounds, candidate-then-base on even
-  ones. The second arm of a back-to-back pair runs roughly 1% slow on a warmer
+  ones. The second arm of a back-to-back pair runs slightly slow on a warmer
   machine; a fixed order hands that penalty to the same arm every round.
 - **Per-run medians.** Each arm contributes its run's median, and the delta is the
   mean of the paired `cand/base` ratios. For the criterion targets the minimum is
   the worst choice: Linear sampling makes the low-iteration samples
   timer-quantised.
-- **Enough pairs, with the standard error reported.** The per-pair ratio has a
-  stdev of about 3.8%, so 15 pairs (the default) buys about ±1%. A delta within
-  two standard errors is reported as `within noise`.
+- **Enough pairs, with the standard error reported.** The standard error falls as
+  1/√pairs, and the report states it, so a result carries its own resolving
+  power. A delta within two standard errors is reported as `within noise`.
 
 ```bash
 # Keep the baseline binary out of target/release/deps/ before rebuilding.

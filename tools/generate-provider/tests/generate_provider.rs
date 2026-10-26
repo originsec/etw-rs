@@ -129,8 +129,7 @@ macro_rules! curated_provider_tests {
         $(
             #[test]
             // Miri aborts the whole binary on the first Win32 call rather than
-            // skipping the test, and these no longer carry `#[ignore]` to keep
-            // them out of its run.
+            // skipping the test.
             #[cfg_attr(miri, ignore = "calls TdhEnumerateProviders (Win32)")]
             fn $name() {
                 check_curated_provider($provider);

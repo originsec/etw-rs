@@ -2,33 +2,32 @@
 r"""Round-robin A/B driver for the live_events benchmarks.
 
 Wall-clock timing on a developer machine cannot resolve small parser changes by
-running one build after the other. Measured on this host, over the 2836-event
-registry capture:
+running one build after the other:
 
-  * a single arm's per-run median drifts 5-13% across repeated runs;
-  * two benches measured ~8s apart *inside one process* disagree by 14.6%
-    (stdev 4.12%), statistically indistinguishable from the cross-process
-    figure -- so the drift is on the seconds timescale and running both arms in
-    one process buys nothing;
-  * the second arm of a back-to-back pair is penalised roughly 1%, because the
+  * a single arm's per-run median drifts by several percent across repeated
+    runs;
+  * the drift is on a seconds timescale, so two benches run seconds apart
+    *inside one process* disagree as much as two processes do -- running both
+    arms in one process buys nothing;
+  * the second arm of a back-to-back pair runs slightly slow, because the
     machine is warmer by then.
 
-What does work is a paired design with enough pairs. The per-pair ratio has a
-stdev of ~3.8%, so the standard error falls as 3.8%/sqrt(pairs): 15 pairs buys
-+/-1%, which resolves a 5% effect at 5 sigma. This driver therefore reports the
-mean paired ratio together with its standard error, so a result states its own
-resolving power instead of implying false precision.
+What does work is a paired design with enough pairs: the standard error of the
+mean paired ratio falls as 1/sqrt(pairs). This driver reports that ratio
+together with its standard error, so a result states its own resolving power
+instead of implying false precision -- and a standard error that jumps is the
+sign that the machine was not idle.
 
 Two details matter and are easy to get wrong:
 
   * **Use each run's median, not its fastest sample.** Under criterion's Linear
     sampling `iters` ramps 1..N, so `times[i]/iters[i]` for the low-iteration
     samples is dominated by timer granularity. The minimum is therefore the
-    *most* quantisation-contaminated sample, not the least: its spread across
-    runs measured 26-33% against 5-11% for the median.
+    *most* quantisation-contaminated sample, not the least, and spreads far
+    more across runs than the median does.
   * **Alternate which arm goes first (ABBA).** Always running base-then-cand
-    hands the ~1% warm-up penalty to the same arm every round, which shows up
-    as a systematic delta between identical binaries.
+    hands the warm-up penalty to the same arm every round, which shows up as a
+    systematic delta between identical binaries.
 
 See "Comparing two builds" in benches/README.md for how to use it.
 
@@ -141,7 +140,7 @@ def main() -> int:
         "--pairs",
         type=int,
         default=15,
-        help="paired rounds (default 15, which buys about +/-1% standard error)",
+        help="paired rounds (default 15); the report gives the resulting standard error",
     )
     ap.add_argument("--target-dir", type=Path, default=Path("target"))
     ap.add_argument(
@@ -181,7 +180,7 @@ def main() -> int:
 
     # ABBA: base-then-cand on odd rounds, cand-then-base on even ones, so each
     # arm spends half its rounds in the warmer second slot. Always ordering
-    # base-then-cand hands that ~1% penalty to the candidate every time.
+    # base-then-cand hands that penalty to the candidate every time.
     reported: dict[tuple[str, int], dict[tuple[str, str], float]] = {}
     for r in range(1, args.pairs + 1):
         order = ("base", "cand") if r % 2 else ("cand", "base")

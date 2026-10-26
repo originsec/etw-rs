@@ -5,41 +5,20 @@
 //!
 //! # Dispatch: why the enum is the only API
 //!
-//! A second approach existed until it was removed: a `{name}_dispatch!` macro that
-//! matched the version once and handed a named `#[inline(always)]` handler the
-//! concrete parser type, so accessors carried no dispatch at all. The enum
-//! (`{Name}Parser`) instead does one `match &mut self.inner` per accessor.
+//! The enum (`{Name}Parser`) does one `match &mut self.inner` per accessor. The
+//! alternative — matching the version once and handing a handler the concrete
+//! parser — only pays off for events whose fields are all fixed width, where a
+//! field is a load at a constant offset and the discriminant check costs about
+//! as much again. Once a field decodes a string, the difference is noise.
 //!
-//! Measured over five live-captured event types, median ns/event across three
-//! passes, each arm written the way a user of that API would write it:
-//!
-//! | Event (fields)            | enum  | macro |
-//! |---------------------------|-------|-------|
-//! | ProcessStart (15, mixed)  | 221.5 | 224.2 |
-//! | RpcClientCall (9, mixed)  | 127.0 | 133.8 |
-//! | RegistryCreateKey (6)     |  68.7 |  66.5 |
-//! | FileCreate (7, mixed)     |  82.7 |  79.6 |
-//! | ThreadStart (10, fixed)   |   9.3 |   5.0 |
-//!
-//! Four of the five land within 5% of each other and fall on both sides of zero,
-//! which is not a difference worth choosing between. The exception is ThreadStart,
-//! whose fields are all fixed width: a field is then a load at a constant offset,
-//! about 1.5 cycles, and the enum's per-accessor discriminant check costs roughly
-//! the same again — so the macro ran at twice the speed. As soon as a field
-//! involves decoding a wide string, that saving disappears into the noise.
-//!
-//! **Decision:** the enum is the only API. Its 2x case is confined to events whose
-//! fields are all fixed width, consumed at volumes where ~5ns/event is material —
-//! an atypical workload. Against that, the macro cost a second public API to
-//! document and support, a `dispatch_module` key that existed in the schema DSL
-//! solely so `#[macro_export]` could resolve type paths cross-crate, and handlers
-//! that could not reach the event header at all without being written as a
+//! That case is atypical, and a dispatch macro would cost a second public API, a
+//! schema-DSL key solely so `#[macro_export]` could resolve type paths
+//! cross-crate, and handlers unable to reach the event header except as a
 //! closure. The per-version parsers (`{Name}V{N}Parser`) are public, so a caller
 //! who genuinely needs zero dispatch can match the version and construct one.
 //!
-//! Also tested while both existed: replacing the enum match with a `u8` version
-//! field + `unreachable_unchecked()` to skip discriminant checks. No measurable
-//! improvement — LLVM already optimises the enum match similarly.
+//! Replacing the enum match with a `u8` version and `unreachable_unchecked()`
+//! gains nothing: LLVM already compiles the enum match comparably.
 
 use crate::schema::{
     FieldDef, accessor_return_type, field_tdh_intype, is_ref_accessor, owned_return_type,

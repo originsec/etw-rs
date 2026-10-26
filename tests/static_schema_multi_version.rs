@@ -12,9 +12,8 @@
 
 use etw::{Error, Guid, provider_schema};
 
-// Two provider_schema! invocations in the same module — previously caused a
-// `validate_all_schemas` name collision; now resolved via the CRT constructor
-// approach, which generates a uniquely named static per invocation.
+// Two provider_schema! invocations in the same module: each must register its
+// validator under a uniquely named static, or `validate_all_schemas` collides.
 
 // Two independent versions with different fields (no extends_version).
 provider_schema! {

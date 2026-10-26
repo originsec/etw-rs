@@ -256,10 +256,9 @@ unsafe fn enumerate_mof_providers_inner() -> Result<Vec<MofProvider>> {
     // Fetch the whole EventTrace subtree in one query and rebuild the hierarchy
     // from __SUPERCLASS, rather than walking it a level at a time.
     //
-    // The walk cost one round trip per class — 1 for the providers, then one per
-    // provider for its categories, then one per category for its events, which
-    // on this machine is 378 queries for 186 providers. `ISA` returns every
-    // descendant at once: 932 rows in ~0.2 s against ~1.1 s for the walk.
+    // A walk costs one round trip per class — one for the providers, then one per
+    // provider for its categories, then one per category for its events, which is
+    // hundreds of queries. `ISA` returns every descendant in a single query.
     //
     // SAFETY: Query string is static and services is a valid IWbemServices handle.
     let subtree = unsafe {

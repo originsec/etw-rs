@@ -1358,8 +1358,8 @@ fn validate_single_version(
     // SAFETY: buffer was returned by TdhGetEventInformation.
     let schema = unsafe { &*(buffer.as_ptr().cast::<TRACE_EVENT_INFO>()) };
     let property_count = schema.TopLevelPropertyCount as usize;
-    // Identity is carried as data, so the provider name no longer has to be
-    // pulled out of the TDH buffer on every validation just to build a message.
+    // Identity is carried as data, so validation never pulls the provider name
+    // out of the TDH buffer just to build a message.
     let context = crate::processing_context::EventContext::new(
         crate::Guid::from_sys(*provider_guid),
         event_id,

@@ -71,9 +71,9 @@ pub(crate) enum FieldOffset {
     ///
     /// `@ fixed_length(N)` states the size at compile time, so the offset of
     /// every later field is still a constant. Treating such a field as the
-    /// start of the variable region -- as it once was -- pushed all of them onto
-    /// the cached sequential path for no reason: the IPv6 kernel network events
-    /// declare two 16-byte addresses ahead of six plain integers.
+    /// start of the variable region would push all of them onto the cached
+    /// sequential path for no reason: the IPv6 kernel network events declare two
+    /// 16-byte addresses ahead of six plain integers.
     FixedBinary { offset: usize, len: usize },
     /// Inferred automatically for variable-length types (WideStrRef, AnsiStrRef, SidRef, etc.)
     Following,

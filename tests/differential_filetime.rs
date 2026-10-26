@@ -1,9 +1,9 @@
-//! Differential test: `Timestamp`'s pure-Rust calendar arithmetic versus the
-//! `FileTimeToSystemTime` it replaced.
+//! Differential test: `Timestamp`'s pure-Rust calendar arithmetic versus
+//! `FileTimeToSystemTime`.
 //!
-//! `Display` used to call the Win32 conversion once per formatted timestamp. It is
-//! now [Howard Hinnant's `civil_from_days`] rebased on the FILETIME epoch, so the
-//! question this file answers is whether the replacement is exact.
+//! `Display` formats with [Howard Hinnant's `civil_from_days`] rebased on the
+//! FILETIME epoch rather than a Win32 call per timestamp, so the question this file
+//! answers is whether that arithmetic is exact.
 //!
 //! It can be exact, which is what makes the comparison worth running. FILETIME is
 //! proleptic Gregorian with no leap seconds and no Julian cut-over, so there is no

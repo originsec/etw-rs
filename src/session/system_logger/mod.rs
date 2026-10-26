@@ -824,9 +824,9 @@ impl Trace {
     /// an error if either `TraceSetInformation` call fails.
     ///
     /// The two calls are not atomic: if `TracePmcCounterListInfo` succeeds and
-    /// `TracePmcEventListInfo` fails, the counters stay applied. Windows 11 26200
-    /// accepts each list once per session and returns `ERROR_WMI_ALREADY_ENABLED`
-    /// for later calls, so a retry on the same session may fail.
+    /// `TracePmcEventListInfo` fails, the counters stay applied. Windows accepts
+    /// each list once per session and returns `ERROR_WMI_ALREADY_ENABLED` for
+    /// later calls, so a retry on the same session may fail.
     ///
     /// # Example
     ///

@@ -2715,11 +2715,11 @@ const CPP_BIN_GROUPS: &[(&str, &str)] = &[
 /// disagreement between passes is reported as that cell's spread.
 ///
 /// This exists because a single pass cannot tell a clean measurement from a
-/// contaminated one. A background build once put `rpc_client_call/etw-rs-static` 54%
-/// high while every neighbouring cell stayed correct — the burst was narrower than
-/// one arm's measurement window, so nothing in a single run's output could have
-/// revealed it. Repeating the whole suite catches that by its effect, whatever the
-/// cause, which no counter-based check can promise.
+/// contaminated one. A burst of background load narrower than one arm's measurement
+/// window can push that one cell far off while every neighbouring cell stays
+/// correct, and nothing in a single run's output reveals it. Repeating the whole
+/// suite catches that by its effect, whatever the cause, which no counter-based
+/// check can promise.
 ///
 /// Three is the useful minimum: with two, disagreement tells you something is wrong
 /// but not which reading to believe, while with three the per-cell median discards a
@@ -2738,16 +2738,14 @@ fn bench_passes() -> usize {
 
 /// Spread above which a cell is called out as untrustworthy, in percent.
 ///
-/// Run-to-run spread on an idle machine measures about 3% here (ten consecutive runs
-/// of `process_start/etw-rs-static` spanned 712.8-754.6ns). 10% is comfortably clear
-/// of that while still catching the 54% excursion that prompted this, and is a
-/// reporting threshold only — the spread is printed for every cell either way, so a
-/// reader can judge a borderline one themselves.
+/// 10% sits well clear of an idle machine's run-to-run spread while still catching a
+/// disturbed pass, and is a reporting threshold only — the spread is printed for
+/// every cell either way, so a reader can judge a borderline one themselves.
 const SPREAD_WARN_PCT: f64 = 10.0;
 
 /// Absolute range below which a cell is never called out, however large its percentage.
 ///
-/// `thread_start/etw-rs-static` measures about 9ns/event, so a sub-2ns wobble on it
+/// The fastest arms cost single-digit ns/event, so a sub-2ns wobble on them
 /// reads as 20%+ — a figure that describes
 /// the denominator rather than the measurement. Flagging them every run would teach
 /// the reader to skip the section, which is worse than not having one.
@@ -3062,15 +3060,15 @@ fn parse_cpp_row(line: &str) -> Option<(String, f64)> {
 // share a name. The C++ headline beside it is an IQR-trimmed mean, which is a
 // different figure and is not comparable.
 //
-// Measured on one thread_start bench, the median, an OLS slope and a trimmed mean
-// of the same data came out at 7.64 / 5.70 / 4.26 ns/event — a near-2x spread on a
-// single benchmark, so the choice of statistic is not cosmetic. The mean is kept
-// beside the median purely as a skew signal: a wide gap means that row is noisy.
+// The choice of statistic is not cosmetic: the median, an OLS slope and a trimmed
+// mean of the same samples can differ by nearly 2x on a single benchmark. The mean
+// is kept beside the median purely as a skew signal: a wide gap means that row is
+// noisy.
 //
 // The Rust benches build one parsed struct per event and drop it immediately,
 // matching cpp_benchmarks.cpp's `DoNotOptimize(parsed)` loop. Keep it that way:
 // accumulating results into a live Vec adds allocator and cache work the C++
-// side never pays, which silently made the two harnesses incomparable.
+// side never pays, which silently makes the two harnesses incomparable.
 //
 // One difference remains by design — Rust `String` is UTF-8, so every wide
 // property is transcoded, while the C++ structs keep `std::wstring` as-is. That
@@ -3097,15 +3095,12 @@ struct ParserColumn {
 ///
 /// `etw-rs (get)` and `etw-rs (get_hinted)` must differ *only* in how they resolve
 /// a property name, so both build their string fields the same way, with
-/// `get`/`get_hinted::<OsString>`. They previously did not: the hinted arms borrowed
-/// a `WideStrRef` and called `to_string_lossy`, which is a different API *and*
-/// different semantics (lossy rather than strict), so the ratio between the two
-/// columns conflated name resolution with string decoding and could not be read
-/// as a hinting comparison at all on any event carrying a string.
-///
-/// Measured in isolation, that string difference was worth under 10ns per field,
-/// so it was never the bulk of the gap — but it made the comparison unsound,
-/// which is worse than making it wrong by a known amount.
+/// `get`/`get_hinted::<OsString>`. Borrowing a `WideStrRef` and calling
+/// `to_string_lossy` in one arm would be a different API *and* different semantics
+/// (lossy rather than lossless), so the ratio between the two columns would
+/// conflate name resolution with string decoding and could not be read as a
+/// hinting comparison on any event carrying a string. The cost difference is small,
+/// but an unsound comparison is worse than one wrong by a known amount.
 const PARSER_COLUMNS: &[ParserColumn] = &[
     ParserColumn {
         id: "etw-rs-static",
@@ -3146,20 +3141,13 @@ struct Measurement {
 // Measurement
 //
 // The Rust arms are timed here rather than by criterion, so that both halves of
-// the published table come from one instrument. They did not: the C++ arms have
-// always been hand-timed by `benchmark_parser` in cpp_benchmarks.cpp while the
-// Rust arms went through criterion, and BENCHMARKS.md prints the two side by side
-// as though that were a comparison.
+// the published table come from one instrument: the C++ arms are hand-timed by
+// `benchmark_parser` in cpp_benchmarks.cpp, and BENCHMARKS.md prints the two side
+// by side.
 //
-// The asymmetry was not theoretical. Criterion's measurement of an arm was
-// observed reading 1.57x slow — uniformly, across all 100 of its samples and
-// including its own minimum — while a hand-timed loop over the same events, in the
-// same process and seconds either side of it, read the true figure. Core clock and
-// memory latency were unchanged across the two, measured directly, so the
-// divergence was in the measurement rather than in the machine or the parser. The
-// state persisted for tens of minutes at a stretch, which is longer than a whole
-// run: every pass of a multi-pass run landed inside it and they all agreed with
-// each other.
+// Two instruments can disagree by enough to change a row, uniformly across every
+// sample, with the machine and the parser unchanged. Such a state can outlast a
+// whole run, so passes that agree with each other do not rule it out.
 //
 // The protocol mirrors `benchmark_parser`: warm up, then time repeated passes over
 // the whole captured set and report the median divided by the event count. One
@@ -3175,10 +3163,10 @@ const SAMPLES: usize = 1000;
 /// Shortest a single timed sample may be, in nanoseconds.
 ///
 /// The C++ harness times exactly one pass per sample. That is fine for its slower
-/// arms and wrong for the fast ones here: `thread_start/etw-rs-static` costs about
-/// 5ns/event over 163 events, so one pass is ~815ns, and `Instant` resolves to a
-/// 100ns QPC tick. That is a 12% quantum landing on precisely the arms where
-/// etw-rs looks best, which would read as a measurement rather than as noise.
+/// arms and wrong for the fast ones here: the fastest finish a whole pass in under
+/// a microsecond, and `Instant` resolves to a 100ns QPC tick. That is a quantum of
+/// 10% or more landing on precisely the arms where etw-rs looks best, which would
+/// read as a measurement rather than as noise.
 ///
 /// So a sample times however many passes are needed to clear this bound and
 /// divides back down. Where one pass already clears it — which is every arm on the
@@ -3649,10 +3637,9 @@ fn main() {
 /// Build and run the C++ arm, or return nothing if it is skipped or unavailable.
 ///
 /// The C++ arm runs before the tables, not after, so its results can go into them.
-/// BENCHMARKS.md quotes Rust and C++ side by side, and for six months those halves came
-/// from separate runs assembled by hand — which is how a Rust column measured under one
-/// set of conditions ended up published beside a C++ column measured under another. One
-/// run, one table, or the comparison is not a comparison.
+/// BENCHMARKS.md quotes Rust and C++ side by side, and halves assembled by hand from
+/// separate runs put columns measured under different conditions next to each other.
+/// One run, one table, or the comparison is not a comparison.
 ///
 /// It costs about a minute per invocation and is irrelevant when re-running one Rust
 /// bench to compare two Rust builds, so `ETW_BENCH_SKIP_CPP=1` drops it for the

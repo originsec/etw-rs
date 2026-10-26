@@ -153,7 +153,7 @@ validate event capture and parsing.
 | `extended_data.rs` | Extended data items: SID, PROCESS_START_KEY, STACK_TRACE |
 | `field_types.rs` | TDH field type parsing against real kernel providers |
 | `network_addr_parsing.rs` | `SocketAddr`, `Ipv4Addr`, `Ipv6Addr` parsing from TCPIP and Kernel-Network providers |
-| `runtime_config.rs` | Runtime provider enable/disable after session start; system-logger `update_events()` / `update_stack_walking()` on a running session; pre-start API misuse panics |
+| `runtime_config.rs` | Runtime provider enable/disable after session start, and event delivery switching with it while processing; system-logger `update_events()` / `update_stack_walking()` on a running session; pre-start API misuse panics |
 | `trace_properties.rs` | Buffer size/count configuration round-trip through `start()`; taking over an existing session name; `session_id()` after start |
 | `userdata_alignment.rs` | Runtime alignment probe validating 8-byte UserData alignment (slow) |
 

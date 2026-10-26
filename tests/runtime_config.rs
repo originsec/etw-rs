@@ -11,9 +11,15 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use etw::Trace;
+use etw::{Trace, session::NO_PER_PROCESSOR_BUFFERING};
 use example_providers::kernel::process;
 use serial_test::serial;
+use std::{
+    process::Command,
+    sync::{Arc, Mutex},
+    thread::sleep,
+    time::{Duration, Instant},
+};
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Trace: runtime provider enable/disable
@@ -53,6 +59,91 @@ fn test_realtime_enable_disable_provider() {
     );
 
     trace.stop().unwrap();
+}
+
+fn spawn_child() -> u32 {
+    let mut child = Command::new("cmd.exe")
+        .args(["/c", "exit"])
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let _ = child.wait();
+    pid
+}
+
+fn wait_for_pid(seen: &Mutex<Vec<u32>>, pid: u32) -> bool {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if seen.lock().unwrap().contains(&pid) {
+            return true;
+        }
+        sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+#[test]
+fn test_realtime_enable_disable_while_processing() {
+    let mut trace = Trace::new("etw-rs_Test_RtLiveDelivery").unwrap();
+    // One buffer stream delivers events in log order, which the absence check
+    // below relies on. It also halves worst-case latency to one flush interval.
+    let _ = trace.set_log_file_mode(NO_PER_PROCESSOR_BUFFERING);
+
+    let seen: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_cb = Arc::clone(&seen);
+    trace.set_event_callback(move |event, context| {
+        if event.id() == process::event::PROCESS_START {
+            let pid: u32 = context.parser(event)?.get("ProcessID")?;
+            seen_cb.lock().unwrap().push(pid);
+        }
+        Ok(())
+    });
+
+    let Some(()) =
+        common::skip_or_panic("start_processing_thread", trace.start_processing_thread())
+    else {
+        return;
+    };
+
+    let before_enable = spawn_child();
+
+    let Some(()) = common::skip_or_panic(
+        "enable_provider",
+        trace.enable_provider(process::GUID, process::keyword::PROCESS),
+    ) else {
+        return;
+    };
+    let enabled = spawn_child();
+    assert!(
+        wait_for_pid(&seen, enabled),
+        "no ProcessStart for PID {enabled} after enabling on a processing session"
+    );
+
+    trace.disable_provider(process::GUID).unwrap();
+    let disabled = spawn_child();
+
+    // Events arrive in log order, so once the re-enabled child is seen, the disabled
+    // child's start would already have been delivered had it been logged.
+    trace
+        .enable_provider(process::GUID, process::keyword::PROCESS)
+        .unwrap();
+    let reenabled = spawn_child();
+    assert!(
+        wait_for_pid(&seen, reenabled),
+        "no ProcessStart for PID {reenabled} after re-enabling on a processing session"
+    );
+
+    trace.stop().unwrap();
+
+    let seen = seen.lock().unwrap();
+    assert!(
+        !seen.contains(&before_enable),
+        "ProcessStart for PID {before_enable} delivered before the provider was enabled"
+    );
+    assert!(
+        !seen.contains(&disabled),
+        "ProcessStart for PID {disabled} delivered after the provider was disabled"
+    );
 }
 
 #[test]

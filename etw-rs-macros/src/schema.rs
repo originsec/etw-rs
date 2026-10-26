@@ -2094,9 +2094,6 @@ pub(crate) fn to_snake_case(s: &str) -> String {
     result
 }
 
-/// Map a Rust type to its expected TDH InType name for validation.
-///
-/// Returns `None` for types that don't have a direct TDH mapping.
 /// The TDH in-type for a field: the declared `@ tdh(...)` if there is one, else the
 /// representative implied by the Rust type.
 pub(crate) fn field_tdh_intype(field: &FieldDef) -> Option<String> {
@@ -2106,6 +2103,9 @@ pub(crate) fn field_tdh_intype(field: &FieldDef) -> Option<String> {
         .or_else(|| type_to_tdh_intype(&field.ty, &field.offset).map(ToOwned::to_owned))
 }
 
+/// Map a Rust type to its expected TDH InType name for validation.
+///
+/// Returns `None` for types that don't have a direct TDH mapping.
 pub(crate) fn type_to_tdh_intype(ty: &Type, offset: &FieldOffset) -> Option<&'static str> {
     if let Type::Path(type_path) = ty
         && let Some(ident) = type_path.path.get_ident()

@@ -415,7 +415,7 @@ mod tests {
     /// Asserted against the first attempt's capacity rather than a second call's
     /// length, because sessions start and stop between two queries.
     #[test]
-    #[cfg(not(miri))] // QueryAllTracesW is a Win32 call, unavailable under Miri.
+    #[cfg_attr(miri, ignore = "calls QueryAllTracesW (Win32)")]
     fn short_first_attempt_retries_instead_of_truncating() {
         let sessions = query_sessions_from(1).expect("enumeration failed");
         if sessions.len() <= 1
@@ -447,7 +447,7 @@ mod tests {
     /// the real one needs 1024 concurrent sessions. The branch under test is the
     /// same either way: a reported count past the ceiling.
     #[test]
-    #[cfg(not(miri))] // QueryAllTracesW is a Win32 call, unavailable under Miri.
+    #[cfg_attr(miri, ignore = "calls QueryAllTracesW (Win32)")]
     fn a_count_past_the_ceiling_is_reported_as_our_limit() {
         let error = match query_sessions_bounded(1, 1) {
             Err(error) => error,
@@ -528,7 +528,7 @@ mod tests {
     /// handed a struct that claims storage past its own end — ETW writes both
     /// names back through these offsets, bounded only by `BufferSize`.
     #[test]
-    #[cfg(not(miri))] // QueryAllTracesW is a Win32 call, unavailable under Miri.
+    #[cfg_attr(miri, ignore = "calls QueryAllTracesW (Win32)")]
     fn returned_properties_describe_only_themselves() {
         let sessions = query_sessions().expect("enumeration failed");
         assert!(!sessions.is_empty(), "Windows always runs ETW sessions");

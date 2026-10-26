@@ -463,7 +463,9 @@ ETW uses UTF-16 (wide strings) extensively. Design:
   can be added if users ask
 
 Tests, benches, examples and `generate-provider` keep `windows` 0.62 as a dev or tool
-dependency for its conveniences. Consumers of the library never see it.
+dependency for its conveniences. Consumers of the library never see it: the `lint`
+step of `ci/check.ps1` fails if any Win32 crate other than `windows-sys` reaches the
+normal dependency graph of `etw-rs`, `etw-rs-macros` or `example-providers`.
 
 ## Non-Goals
 

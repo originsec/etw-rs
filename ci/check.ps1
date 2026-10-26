@@ -94,6 +94,20 @@ function Invoke-Step([string] $Name) {
         'lint' {
             # `--all-targets` builds everything, so there is no separate build step.
             Invoke-Native { cargo $tc clippy --all-targets --workspace -- -D warnings }
+            # Consumers get windows-sys only; the typed `windows` crate is dev-only.
+            # `example-providers` stands in for a downstream crate, so code the
+            # macros generate is held to the same rule. `-i windows` cannot express
+            # this: it errors as ambiguous while two `windows` versions are locked.
+            $graph = Invoke-Native {
+                cargo $tc tree -p etw-rs -p etw-rs-macros -p example-providers `
+                    -e normal,build --target all --prefix none --format '{p}'
+            }
+            $leaked = $graph | ForEach-Object { ($_ -split ' ')[0] } |
+                Where-Object { $_ -like 'windows*' -and $_ -notmatch '^(windows-sys|windows-link|windows-targets|windows_.+)$' } |
+                Sort-Object -Unique
+            if ($leaked) {
+                throw "non-windows-sys Win32 crates in the published dependency graph: $($leaked -join ', '). Move them to [dev-dependencies]."
+            }
             # Rustdoc warnings (broken or private intra-doc links) do not fail
             # `cargo doc`, so they accumulate unnoticed unless denied here.
             $saved = $env:RUSTDOCFLAGS

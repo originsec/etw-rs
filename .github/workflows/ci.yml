@@ -87,7 +87,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ hashFiles('ci/check.ps1') }}
-      - name: Clippy and rustdoc
+      - name: Clippy, rustdoc, windows-sys-only dependency guard
         run: ./ci/check.ps1 lint
 
   test:

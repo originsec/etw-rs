@@ -678,16 +678,22 @@ impl<'a> WideStrRef<'a> {
     /// Length in bytes of `data` up to, but excluding, its null terminator.
     ///
     /// Drops exactly one trailing null code unit when present, otherwise
-    /// truncates at the first embedded null, otherwise returns the full length —
-    /// the same rule [`WideString::from_bytes`] applies to owned data. Factored
-    /// out so the borrowing decoders can share it without also inheriting
-    /// [`Self::from_raw_with_null`]'s even-length debug assertion.
+    /// truncates at the first embedded null, otherwise returns the whole code
+    /// units — the same rule [`WideString::from_bytes`] applies to owned data.
+    /// Factored out so the borrowing decoders can share it without also
+    /// inheriting [`Self::from_raw_with_null`]'s even-length debug assertion.
     pub(crate) fn null_terminated_len(data: &[u8]) -> usize {
         let byte_len = data.len();
-        if byte_len >= 2 && data[byte_len - 2] == 0 && data[byte_len - 1] == 0 {
+        // On odd-length data the last two bytes straddle a code unit and a stray
+        // byte, so they say nothing about a terminator.
+        if byte_len >= 2
+            && byte_len.is_multiple_of(2)
+            && data[byte_len - 2] == 0
+            && data[byte_len - 1] == 0
+        {
             byte_len - 2
         } else {
-            Self::find_null_terminator(data).unwrap_or(byte_len)
+            Self::find_null_terminator(data).unwrap_or(byte_len & !1)
         }
     }
 

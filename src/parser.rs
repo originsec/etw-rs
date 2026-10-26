@@ -1954,10 +1954,10 @@ impl FromProperty for String {
                 // what the AnsiString arm below already does.
                 //
                 // Slicing comes from the same `wide_string_payload` the owned
-                // impl uses, and the null-terminator rule from the same
-                // `null_terminated_len` that backs `WideString::from_bytes`, so
-                // this is a pure allocation saving: same output, and the same
-                // errors on malformed input. Both decode via the strict
+                // impl uses, and `null_terminated_len` applies the terminator
+                // rule `WideString::from_bytes` does, so this is a pure
+                // allocation saving: same output, and the same errors on
+                // malformed input. Both decode via the strict
                 // `String::from_utf16`, so a lone surrogate still errors rather
                 // than being replaced.
                 let payload = wide_string_payload(data, in_type)?;
@@ -2349,15 +2349,7 @@ impl<'a> FromPropertyRef<'a> for WideStrRef<'a> {
     fn from_property_ref(data: &'a [u8], in_type: TdhInType) -> Result<Self> {
         match in_type {
             TdhInType::UnicodeString => {
-                // Fast path: ETW property sizes include the null terminator, so it is almost
-                // always the trailing u16. Checking the final two bytes avoids an O(n) scan.
-                let byte_len = data.len();
-                let len = if byte_len >= 2 && data[byte_len - 2] == 0 && data[byte_len - 1] == 0 {
-                    byte_len - 2
-                } else {
-                    Self::find_null_terminator(data).unwrap_or(byte_len)
-                };
-                Ok(WideStrRef::new(&data[..len]))
+                Ok(WideStrRef::new(&data[..Self::null_terminated_len(data)]))
             }
             TdhInType::NonNullTerminatedString => {
                 // No null terminator to strip — data slice is the full content.
@@ -2520,6 +2512,42 @@ mod tests {
                 owned.as_deref().ok(),
                 "{in_type:?}: borrowed String disagrees with owned WideString"
             );
+        }
+    }
+
+    /// An odd byte length leaves a stray byte after the last code unit, so the
+    /// final two bytes straddle a character and cannot be a terminator. A
+    /// declared or truncated length can be odd, and reading such a pair as a null
+    /// drops the character before it.
+    #[test]
+    fn string_matches_widestring_on_odd_length_wide_input() {
+        let cases: [(&[u8], &str); 4] = [
+            (&[0x41, 0x00, 0x00], "A"),
+            (&[0x41, 0x00, 0x42, 0x00, 0x00], "AB"),
+            (&[0x41, 0x00, 0x42], "A"),
+            // An embedded null still truncates, as it does on even input.
+            (&[0x41, 0x00, 0x00, 0x00, 0x42, 0x00, 0x00, 0x00, 0xFF], "A"),
+        ];
+        for in_type in [TdhInType::UnicodeString, TdhInType::NonNullTerminatedString] {
+            for (data, expected) in cases {
+                let owned = WideString::from_property(data, in_type, TdhOutType::Null)
+                    .and_then(|w| w.decode_utf16());
+                assert_eq!(
+                    owned.as_deref().ok(),
+                    Some(expected),
+                    "{in_type:?} {data:02X?}"
+                );
+                let borrowed = String::from_property(data, in_type, TdhOutType::Null);
+                assert_eq!(
+                    borrowed.as_deref().ok(),
+                    Some(expected),
+                    "{in_type:?} {data:02X?}"
+                );
+            }
+        }
+        for (data, expected) in cases {
+            let wide = WideStrRef::from_property_ref(data, TdhInType::UnicodeString).unwrap();
+            assert_eq!(wide.decode_utf16().unwrap(), expected, "{data:02X?}");
         }
     }
 

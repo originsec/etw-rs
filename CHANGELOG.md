@@ -43,6 +43,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so UTF-8 fields such as Kernel-EventTracing event 31 `EventName` came back mis-decoded or
   as an error. Applies to `get::<String>()`, the static owned accessor and `Property`'s
   `Display`.
+- A wide string with an odd byte length no longer loses its last character when decoded
+  from a borrow (`as_ref::<WideStrRef>()`, the static wide accessors, `get()`): the final
+  two bytes straddle a code unit and a stray byte, and were mistaken for a terminator.
+  `41 00 42 00 00` decoded as `"A"` rather than `"AB"`.
 
 ## [0.1.0] - 2026-10-23
 

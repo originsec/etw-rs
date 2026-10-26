@@ -383,13 +383,14 @@ pub fn parse_wide_string_sized(
     }
 
     // Strip trailing NULL terminator if present. ETW can sometimes drop the
-    // NULL on the last property, so we must check before stripping.
-    let string_data = &data[start_offset..start_offset + size_bytes];
-    let content_len = if size_bytes >= 2 && string_data[size_bytes - 2..] == [0, 0] {
-        size_bytes - 2
+    // NULL on the last property, so we must check before stripping. Only whole
+    // code units count: a stray odd byte is dropped before the check.
+    let whole_units = size_bytes & !1;
+    let string_data = &data[start_offset..start_offset + whole_units];
+    let content_len = if whole_units >= 2 && string_data[whole_units - 2..] == [0, 0] {
+        whole_units - 2
     } else {
-        // No NULL terminator — round down to even byte count for u16 alignment
-        size_bytes & !1
+        whole_units
     };
 
     Ok(WideStrRef::new(
@@ -1697,6 +1698,20 @@ mod tests {
         ];
         let result = parse_wide_string_sized(&data, 0, 4).expect("should parse");
         assert_eq!(result.len(), 2); // Must still get both code units
+    }
+
+    #[test]
+    fn test_parse_wide_string_sized_odd_length_keeps_last_unit() {
+        // The final two bytes of an odd span straddle 'B' and a stray byte, so
+        // they are not a terminator.
+        let data = [0x41, 0x00, 0x42, 0x00, 0x00];
+        let result = parse_wide_string_sized(&data, 0, 5).expect("should parse");
+        assert_eq!(result.decode_utf16().expect("valid UTF-16"), "AB");
+
+        // A whole trailing null unit is still stripped once the stray byte goes.
+        let data = [0x41, 0x00, 0x00, 0x00, 0xFF];
+        let result = parse_wide_string_sized(&data, 0, 5).expect("should parse");
+        assert_eq!(result.decode_utf16().expect("valid UTF-16"), "A");
     }
 
     #[test]

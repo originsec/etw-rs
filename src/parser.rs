@@ -1630,9 +1630,6 @@ impl<'a> EventParser<'a> {
         }
         let location = self.cache.locations[index as usize];
         let in_type = location.in_type;
-        // Read from the schema rather than the cached location: `prop` is
-        // already in hand here, and the out-type is needed only for the rare
-        // sizing cases, so it is not worth carrying in every location entry.
         let out_type = TdhOutType::from_raw(prop.out_type());
 
         // When has_param_length is set, prop.length() returns a property index

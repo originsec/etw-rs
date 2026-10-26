@@ -3774,7 +3774,6 @@ mod position_tests {
     const UTF8_CAFE: &[u8] = &[0x63, 0x61, 0x66, 0xC3, 0xA9, 0x00];
 
     #[test]
-    #[cfg_attr(miri, ignore = "calls MultiByteToWideChar (Win32)")]
     fn dynamic_ansi_string_decodes_by_out_type() {
         for out_type in [TdhOutType::Utf8, TdhOutType::Json, TdhOutType::Xml] {
             let (schema, mut cache) = MockSchemaBuilder::new()
@@ -3800,7 +3799,6 @@ mod position_tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "calls MultiByteToWideChar (Win32)")]
     fn utf8_out_type_rejects_invalid_utf8() {
         // 0xE9 is "é" in Windows-1252 but a truncated sequence in UTF-8.
         let data = [0x63, 0x61, 0x66, 0xE9, 0x00];

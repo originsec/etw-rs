@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unpaired surrogates in file names, registry keys and similar identifiers; the `String`
   accessor rejected such events. Use the `_ref()` accessor with `decode_utf16()` or
   `to_string_lossy()` for a `String`.
+- `AnsiStrRef::decode(CP_UTF8)` decodes without a round trip through Win32 and UTF-16,
+  2–3.7× faster. Results and errors are unchanged.
 
 ### Fixed
 

@@ -347,7 +347,6 @@ event_schema! { name: "Utf8Ansi", id: 46, version: 0, fields: { Target: AnsiStrR
 event_schema! { name: "Utf8CAnsi", id: 47, version: 0, fields: { Target: CountedAnsiStrRef @ out(Utf8), Sentinel: u32 }}
 
 #[test]
-#[cfg_attr(miri, ignore = "calls MultiByteToWideChar (Win32)")]
 fn utf8_out_type_ansi_owned_accessors_decode_utf8() -> etw::Result<()> {
     let mut d = ansi_str_bytes("café");
     d.extend_from_slice(&0xCAFEu32.to_le_bytes());

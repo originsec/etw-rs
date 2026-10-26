@@ -149,8 +149,8 @@ name = "07_manual"
 path = "examples/07_manual.rs"
 
 [[example]]
-name = "09_tracelogging"
-path = "examples/09_tracelogging.rs"
+name = "08_tracelogging"
+path = "examples/08_tracelogging.rs"
 
 [[example]]
 name = "10_simple_system_trace"

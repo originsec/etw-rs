@@ -26,7 +26,7 @@
 //! # Usage
 //!
 //! ```bash
-//! cargo run --example 09_tracelogging
+//! cargo run --example 08_tracelogging
 //! ```
 
 use etw::{ALL_KEYWORDS, Guid, Trace};

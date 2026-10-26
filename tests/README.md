@@ -301,6 +301,7 @@ data, or live TDH metadata without a session.
 | `static_schema_multi_version.rs` | Multi-version `provider_schema!` dispatch, superset trait, dynamic fallback |
 | `validate_all_schemas.rs` | `__register_schema_validator` enqueues validators and `validate_all_schemas()` runs them, propagating the first error |
 | `validate_next_version_hints.rs` | N+1 canary — TDH check that stale index hints are detected |
+| `validate_out_type.rs` | TDH check that an ANSI field's `@ out(...)` must match the manifest's out-type |
 
 Provider generation is tested in its own crate, in
 `tools/generate-provider/tests/generate_provider.rs`: the generation pipeline and

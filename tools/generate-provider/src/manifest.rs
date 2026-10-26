@@ -80,6 +80,8 @@ pub struct EventFieldInfo {
     /// The TDH InType value (e.g., 1 = UnicodeString, 8 = UInt32, 16 = Pointer).
     /// For struct properties ([`PROPERTY_STRUCT`]), this is 0 (not meaningful).
     pub in_type: u16,
+    /// The TDH OutType value (e.g., 35 = Utf8). 0 for struct properties.
+    pub out_type: u16,
     /// Property flags from TDH ([`PROPERTY_STRUCT`], [`PROPERTY_PARAM_LENGTH`],
     /// [`PROPERTY_PARAM_COUNT`]).
     pub flags: u32,
@@ -907,17 +909,18 @@ pub(crate) unsafe fn extract_fields_from_trace_event_info(
 
         // For struct properties, read from structType union variant;
         // for non-struct properties, read from nonStructType.
-        let (in_type, struct_byte_size) = if is_struct {
+        let (in_type, out_type, struct_byte_size) = if is_struct {
             // SAFETY: is_struct flag checked, so structType is the active variant.
             let start = unsafe { prop.Anonymous1.structType.StructStartIndex };
             // SAFETY: is_struct flag checked, so structType is the active variant.
             let count = unsafe { prop.Anonymous1.structType.NumOfStructMembers };
             // SAFETY: properties_ptr has at least start+count elements.
             let byte_size = unsafe { compute_struct_byte_size(properties_ptr, start, count) };
-            (0u16, byte_size)
+            (0u16, 0u16, byte_size)
         } else {
             // SAFETY: Not a struct, so nonStructType is the active variant.
-            (unsafe { prop.Anonymous1.nonStructType.InType }, None)
+            let types = unsafe { prop.Anonymous1.nonStructType };
+            (types.InType, types.OutType, None)
         };
 
         // PropertyParamLength: Anonymous3 is a property index, not a byte length.
@@ -948,6 +951,7 @@ pub(crate) unsafe fn extract_fields_from_trace_event_info(
         fields.push(EventFieldInfo {
             name,
             in_type,
+            out_type,
             flags,
             length_property_index,
             count,

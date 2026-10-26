@@ -67,7 +67,7 @@ fn make_mock_event(
 fn bench_type_parsing(c: &mut Criterion) {
     use etw::{
         parser::FromProperty,
-        types::{AnsiString, TdhInType, WideString},
+        types::{AnsiString, TdhInType, TdhOutType, WideString},
     };
 
     let mut group = c.benchmark_group("type_parsing");
@@ -77,7 +77,8 @@ fn bench_type_parsing(c: &mut Criterion) {
     group.bench_function("u32", |b| {
         b.iter(|| {
             let result: u32 =
-                FromProperty::from_property(bb(&u32_data), TdhInType::UInt32).unwrap();
+                FromProperty::from_property(bb(&u32_data), TdhInType::UInt32, TdhOutType::Null)
+                    .unwrap();
             bb(result)
         })
     });
@@ -87,7 +88,8 @@ fn bench_type_parsing(c: &mut Criterion) {
     group.bench_function("u64", |b| {
         b.iter(|| {
             let result: u64 =
-                FromProperty::from_property(bb(&u64_data), TdhInType::UInt64).unwrap();
+                FromProperty::from_property(bb(&u64_data), TdhInType::UInt64, TdhOutType::Null)
+                    .unwrap();
             bb(result)
         })
     });
@@ -96,7 +98,8 @@ fn bench_type_parsing(c: &mut Criterion) {
     group.bench_function("pointer", |b| {
         b.iter(|| {
             let result: u64 =
-                FromProperty::from_property(bb(&u64_data), TdhInType::Pointer).unwrap();
+                FromProperty::from_property(bb(&u64_data), TdhInType::Pointer, TdhOutType::Null)
+                    .unwrap();
             bb(result)
         })
     });
@@ -111,7 +114,8 @@ fn bench_type_parsing(c: &mut Criterion) {
     group.bench_function("guid", |b| {
         b.iter(|| {
             let result: etw::Guid =
-                FromProperty::from_property(bb(&guid_data), TdhInType::Guid).unwrap();
+                FromProperty::from_property(bb(&guid_data), TdhInType::Guid, TdhOutType::Null)
+                    .unwrap();
             bb(result)
         })
     });
@@ -124,9 +128,12 @@ fn bench_type_parsing(c: &mut Criterion) {
         .collect();
     group.bench_function("unicode_string_short", |b| {
         b.iter(|| {
-            let result: WideString =
-                FromProperty::from_property(bb(unicode_str.as_slice()), TdhInType::UnicodeString)
-                    .unwrap();
+            let result: WideString = FromProperty::from_property(
+                bb(unicode_str.as_slice()),
+                TdhInType::UnicodeString,
+                TdhOutType::Null,
+            )
+            .unwrap();
             bb(result)
         })
     });
@@ -142,9 +149,12 @@ fn bench_type_parsing(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(unicode_long.len() as u64));
     group.bench_function("unicode_string_long", |b| {
         b.iter(|| {
-            let result: WideString =
-                FromProperty::from_property(bb(unicode_long.as_slice()), TdhInType::UnicodeString)
-                    .unwrap();
+            let result: WideString = FromProperty::from_property(
+                bb(unicode_long.as_slice()),
+                TdhInType::UnicodeString,
+                TdhOutType::Null,
+            )
+            .unwrap();
             bb(result)
         })
     });
@@ -154,9 +164,12 @@ fn bench_type_parsing(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(ansi_str.len() as u64));
     group.bench_function("ansi_string_short", |b| {
         b.iter(|| {
-            let result: AnsiString =
-                FromProperty::from_property(bb(ansi_str.as_slice()), TdhInType::AnsiString)
-                    .unwrap();
+            let result: AnsiString = FromProperty::from_property(
+                bb(ansi_str.as_slice()),
+                TdhInType::AnsiString,
+                TdhOutType::Null,
+            )
+            .unwrap();
             bb(result)
         })
     });
@@ -166,8 +179,12 @@ fn bench_type_parsing(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(binary_data.len() as u64));
     group.bench_function("binary_256", |b| {
         b.iter(|| {
-            let result: Vec<u8> =
-                FromProperty::from_property(bb(binary_data.as_slice()), TdhInType::Binary).unwrap();
+            let result: Vec<u8> = FromProperty::from_property(
+                bb(binary_data.as_slice()),
+                TdhInType::Binary,
+                TdhOutType::Null,
+            )
+            .unwrap();
             bb(result)
         })
     });
@@ -178,7 +195,8 @@ fn bench_type_parsing(c: &mut Criterion) {
     group.bench_function("bool", |b| {
         b.iter(|| {
             let result: bool =
-                FromProperty::from_property(bb(&bool_data), TdhInType::Boolean).unwrap();
+                FromProperty::from_property(bb(&bool_data), TdhInType::Boolean, TdhOutType::Null)
+                    .unwrap();
             bb(result)
         })
     });
@@ -197,8 +215,12 @@ fn bench_type_parsing(c: &mut Criterion) {
     ];
     group.bench_function("systemtime", |b| {
         b.iter(|| {
-            let result: etw::SystemTime =
-                FromProperty::from_property(bb(&systemtime_data), TdhInType::SystemTime).unwrap();
+            let result: etw::SystemTime = FromProperty::from_property(
+                bb(&systemtime_data),
+                TdhInType::SystemTime,
+                TdhOutType::Null,
+            )
+            .unwrap();
             bb(result)
         })
     });

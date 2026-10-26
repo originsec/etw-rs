@@ -29,11 +29,12 @@
 //! | `Sid`            | yes                | —                  |
 //! | Primitives       | yes                | —                  |
 //!
-//! `get::<String>()` decodes ANSI fields using the process active code page
-//! (CP_ACP). This is correct for events produced on the same machine, but may
-//! yield wrong results for events captured on a machine with a different locale.
-//! Use [`AnsiStrRef`] and [`AnsiStrRef::decode`] to specify the code page
-//! explicitly.
+//! `get::<String>()` decodes an ANSI field by its TDH out-type: `Utf8`, `Json`
+//! and `Xml` as UTF-8, anything else with the process active code page
+//! (CP_ACP). The latter is correct for events produced on the same machine, but
+//! may yield wrong results for events captured on a machine with a different
+//! locale. Use [`AnsiStrRef`] and [`AnsiStrRef::decode`] to specify the code
+//! page explicitly.
 //!
 //! # Example
 //!
@@ -59,7 +60,7 @@ use crate::{
         WideString,
     },
 };
-use windows_sys::Win32::System::SystemServices::SID_MAX_SUB_AUTHORITIES;
+use windows_sys::Win32::{Globalization::CP_UTF8, System::SystemServices::SID_MAX_SUB_AUTHORITIES};
 
 /// Cached information about a parsed property's location in the buffer.
 ///
@@ -229,25 +230,25 @@ impl<'a> Property<'a> {
     /// Returns the property as an owned UTF-16 string.
     #[inline]
     pub fn to_wide_string(&self) -> Result<WideString> {
-        WideString::from_property(self.data, self.in_type)
+        WideString::from_property(self.data, self.in_type, self.out_type)
     }
 
     /// Returns the property as a u32.
     #[inline]
     pub fn as_u32(&self) -> Result<u32> {
-        u32::from_property(self.data, self.in_type)
+        u32::from_property(self.data, self.in_type, self.out_type)
     }
 
     /// Returns the property as a u64.
     #[inline]
     pub fn as_u64(&self) -> Result<u64> {
-        u64::from_property(self.data, self.in_type)
+        u64::from_property(self.data, self.in_type, self.out_type)
     }
 
     /// Returns the property as a generic type implementing [`FromProperty`].
     #[inline]
     pub fn get<T: FromProperty>(&self) -> Result<T> {
-        T::from_property(self.data, self.in_type)
+        T::from_property(self.data, self.in_type, self.out_type)
     }
 
     /// Returns the property as a zero-copy reference type implementing [`FromPropertyRef`].
@@ -366,6 +367,9 @@ impl std::fmt::Display for Property<'_> {
             | TdhInType::ReversedCountedAnsiString
             | TdhInType::NonNullTerminatedAnsiString
             | TdhInType::ManifestCountedAnsiString => match self.get::<AnsiString>() {
+                Ok(s) if self.out_type.ansi_code_page() == CP_UTF8 => {
+                    write!(f, "{}", String::from_utf8_lossy(s.as_bytes()))
+                }
                 Ok(s) => write!(f, "{s}"),
                 Err(_) => write!(f, "<parse error>"),
             },
@@ -813,7 +817,7 @@ impl<'a> EventParser<'a> {
     fn get_undecorated<T: FromProperty>(&mut self, name: &str) -> Result<T> {
         let index = self.find_property_at_learned_hint(name)?;
         let (prop_data, in_type) = self.get_raw_property_at(index)?;
-        T::from_property(prop_data, in_type)
+        T::from_property(prop_data, in_type, self.out_type_for::<T>(index, in_type))
     }
 
     /// Gets a property by name with an index hint for O(1) lookup.
@@ -842,7 +846,11 @@ impl<'a> EventParser<'a> {
                 Error::parse(format!("location {target} not in cache after compute"))
             })?;
 
-        T::from_property(self.slice_property(*location), location.in_type)
+        T::from_property(
+            self.slice_property(*location),
+            location.in_type,
+            self.out_type_for::<T>(index, location.in_type),
+        )
     }
 
     // =========================================================================
@@ -1025,6 +1033,25 @@ impl<'a> EventParser<'a> {
         } else {
             let available = (self.data.len() - location.offset()).min(location.size());
             &self.data[location.offset()..location.offset() + available]
+        }
+    }
+
+    /// The out-type `T` is parsed with: the schema's, if `T` reads it for this
+    /// in-type, else `Null`.
+    ///
+    /// Gated on [`FromProperty::reads_out_type`] so that the lookup — a read from
+    /// the schema's `EVENT_PROPERTY_INFO`, outside the location cache — stays off
+    /// the `get()` path of every property that does not need it.
+    #[inline]
+    fn out_type_for<T: FromProperty>(&self, index: u32, in_type: TdhInType) -> TdhOutType {
+        if T::reads_out_type(in_type) {
+            self.schema
+                .property(index)
+                .map_or(TdhOutType::Null, |prop| {
+                    TdhOutType::from_raw(prop.out_type())
+                })
+        } else {
+            TdhOutType::Null
         }
     }
 
@@ -1747,13 +1774,30 @@ impl std::fmt::Debug for EventParser<'_> {
 /// Trait for types that can be parsed from a property buffer.
 ///
 /// Implemented by all types that [`EventParser::get`] and [`EventParser::get_hinted`]
-/// can return, including primitives, [`WideString`], [`AnsiString`], and `String`
-/// (Unicode fields only).
+/// can return, including primitives, [`WideString`], [`AnsiString`], `OsString`
+/// and `String`.
 ///
 /// Assumes 64-bit event data (this crate supports only x86_64 and aarch64).
 pub trait FromProperty: Sized {
-    /// Parses `Self` from `data`, interpreting it according to `in_type`.
-    fn from_property(data: &[u8], in_type: TdhInType) -> Result<Self>;
+    /// Whether [`from_property`](Self::from_property) reads its `out_type` for a
+    /// property of this `in_type`.
+    ///
+    /// [`EventParser::get`] looks the out-type up only when this returns `true`,
+    /// and passes [`TdhOutType::Null`] otherwise: the lookup reads the schema, and
+    /// almost no property needs it. An impl that does consult `out_type` must
+    /// override this, or it will only ever see `Null` from the parser.
+    #[must_use]
+    fn reads_out_type(in_type: TdhInType) -> bool {
+        let _ = in_type;
+        false
+    }
+
+    /// Parses `Self` from `data`, laid out according to `in_type`.
+    ///
+    /// `out_type` is the property's declared output type. Most types ignore it;
+    /// `String` uses it to pick the code page of an ANSI string
+    /// ([`TdhOutType::ansi_code_page`]).
+    fn from_property(data: &[u8], in_type: TdhInType, out_type: TdhOutType) -> Result<Self>;
 }
 
 /// Trait for types that can be borrowed from a property buffer without copying.
@@ -1832,13 +1876,13 @@ fn wide_string_payload(data: &[u8], in_type: TdhInType) -> Result<&[u8]> {
 }
 
 impl FromProperty for WideString {
-    fn from_property(data: &[u8], in_type: TdhInType) -> Result<Self> {
+    fn from_property(data: &[u8], in_type: TdhInType, _: TdhOutType) -> Result<Self> {
         Ok(Self::from_bytes(wide_string_payload(data, in_type)?))
     }
 }
 
 impl FromProperty for AnsiString {
-    fn from_property(data: &[u8], in_type: TdhInType) -> Result<Self> {
+    fn from_property(data: &[u8], in_type: TdhInType, _: TdhOutType) -> Result<Self> {
         match in_type {
             TdhInType::AnsiString | TdhInType::NonNullTerminatedAnsiString => {
                 Ok(Self::from_bytes(data))
@@ -1868,14 +1912,14 @@ impl FromProperty for AnsiString {
 }
 
 impl FromProperty for std::ffi::OsString {
-    fn from_property(data: &[u8], in_type: TdhInType) -> Result<Self> {
+    fn from_property(data: &[u8], in_type: TdhInType, out_type: TdhOutType) -> Result<Self> {
         match in_type {
             TdhInType::UnicodeString
             | TdhInType::NonNullTerminatedString
             | TdhInType::CountedString
             | TdhInType::ReversedCountedString
             | TdhInType::ManifestCountedString => {
-                Ok(WideString::from_property(data, in_type)?.to_os_string())
+                Ok(WideString::from_property(data, in_type, out_type)?.to_os_string())
             }
             _ => Err(Error::parse(format!(
                 "Cannot parse OsString from {in_type:?}"
@@ -1885,7 +1929,18 @@ impl FromProperty for std::ffi::OsString {
 }
 
 impl FromProperty for String {
-    fn from_property(data: &[u8], in_type: TdhInType) -> Result<Self> {
+    fn reads_out_type(in_type: TdhInType) -> bool {
+        matches!(
+            in_type,
+            TdhInType::AnsiString
+                | TdhInType::NonNullTerminatedAnsiString
+                | TdhInType::CountedAnsiString
+                | TdhInType::ReversedCountedAnsiString
+                | TdhInType::ManifestCountedAnsiString
+        )
+    }
+
+    fn from_property(data: &[u8], in_type: TdhInType, out_type: TdhOutType) -> Result<Self> {
         match in_type {
             TdhInType::UnicodeString
             | TdhInType::NonNullTerminatedString
@@ -1909,18 +1964,14 @@ impl FromProperty for String {
                 let end = WideStrRef::null_terminated_len(payload);
                 WideStrRef::new(&payload[..end]).decode_utf16()
             }
-            // ANSI fields decoded using the process active code page (CP_ACP).
-            // Correct for events produced on the same machine; use AnsiStrRef::decode
-            // with an explicit code page for remote or locale-specific event sources.
-            // Borrow via AnsiStrRef to avoid copying the bytes into an owned AnsiString
-            // before decoding.
+            // Borrow via AnsiStrRef to avoid copying the bytes into an owned
+            // AnsiString before decoding.
             TdhInType::AnsiString
             | TdhInType::NonNullTerminatedAnsiString
             | TdhInType::CountedAnsiString
             | TdhInType::ReversedCountedAnsiString
             | TdhInType::ManifestCountedAnsiString => {
-                use windows_sys::Win32::Globalization::CP_ACP;
-                AnsiStrRef::from_property_ref(data, in_type)?.decode(CP_ACP)
+                AnsiStrRef::from_property_ref(data, in_type)?.decode(out_type.ansi_code_page())
             }
             _ => Err(Error::parse(format!(
                 "Cannot parse String from {in_type:?}"
@@ -1932,7 +1983,7 @@ impl FromProperty for String {
 macro_rules! impl_from_property_primitive {
     ($t:ty, $size:expr, $($variant:pat),+) => {
         impl FromProperty for $t {
-            fn from_property(data: &[u8], in_type: TdhInType) -> Result<Self> {
+            fn from_property(data: &[u8], in_type: TdhInType, _: TdhOutType) -> Result<Self> {
                 match in_type {
                     $($variant)|+ => {
                         // Fast path: data is exactly the right size (common case)
@@ -1986,7 +2037,7 @@ impl_from_property_primitive!(f32, 4, TdhInType::Float);
 impl_from_property_primitive!(f64, 8, TdhInType::Double);
 
 impl FromProperty for bool {
-    fn from_property(data: &[u8], in_type: TdhInType) -> Result<Self> {
+    fn from_property(data: &[u8], in_type: TdhInType, _: TdhOutType) -> Result<Self> {
         match in_type {
             TdhInType::Boolean => {
                 // Any non-zero byte is truthy — consistent with Property::fmt.
@@ -1999,7 +2050,7 @@ impl FromProperty for bool {
 }
 
 impl FromProperty for usize {
-    fn from_property(data: &[u8], in_type: TdhInType) -> Result<Self> {
+    fn from_property(data: &[u8], in_type: TdhInType, _: TdhOutType) -> Result<Self> {
         match in_type {
             TdhInType::Pointer | TdhInType::SizeT => {
                 // Pointer/SizeT is 4 or 8 bytes (or fewer when ETW truncates trailing zeros)
@@ -2021,7 +2072,7 @@ impl FromProperty for usize {
 }
 
 impl FromProperty for Vec<u8> {
-    fn from_property(data: &[u8], in_type: TdhInType) -> Result<Self> {
+    fn from_property(data: &[u8], in_type: TdhInType, _: TdhOutType) -> Result<Self> {
         match in_type {
             TdhInType::Binary => Ok(data.to_vec()),
             _ => Err(Error::parse(format!(
@@ -2082,7 +2133,7 @@ fn parse_sockaddr_v6(data: &[u8]) -> Result<std::net::SocketAddr> {
 }
 
 impl FromProperty for std::net::SocketAddr {
-    fn from_property(data: &[u8], in_type: TdhInType) -> Result<Self> {
+    fn from_property(data: &[u8], in_type: TdhInType, _: TdhOutType) -> Result<Self> {
         match in_type {
             TdhInType::Binary => parse_sockaddr(data),
             _ => Err(Error::parse(format!(
@@ -2093,7 +2144,7 @@ impl FromProperty for std::net::SocketAddr {
 }
 
 impl FromProperty for std::net::Ipv4Addr {
-    fn from_property(data: &[u8], in_type: TdhInType) -> Result<Self> {
+    fn from_property(data: &[u8], in_type: TdhInType, _: TdhOutType) -> Result<Self> {
         match in_type {
             // Binary / UInt32 — exactly 4 bytes in network byte order.
             // Exact length match prevents confusion with SOCKADDR_IN (8+ bytes).
@@ -2114,7 +2165,7 @@ impl FromProperty for std::net::Ipv4Addr {
 }
 
 impl FromProperty for std::net::Ipv6Addr {
-    fn from_property(data: &[u8], in_type: TdhInType) -> Result<Self> {
+    fn from_property(data: &[u8], in_type: TdhInType, _: TdhOutType) -> Result<Self> {
         match in_type {
             // Binary / Guid — exactly 16 bytes in network byte order.
             // Exact length match prevents confusion with SOCKADDR_IN6 (24+ bytes).
@@ -2137,7 +2188,7 @@ impl FromProperty for std::net::Ipv6Addr {
 }
 
 impl FromProperty for SystemTime {
-    fn from_property(data: &[u8], in_type: TdhInType) -> Result<Self> {
+    fn from_property(data: &[u8], in_type: TdhInType, _: TdhOutType) -> Result<Self> {
         match in_type {
             TdhInType::SystemTime => {
                 if data.len() < 16 {
@@ -2162,7 +2213,7 @@ impl FromProperty for SystemTime {
 }
 
 impl FromProperty for Timestamp {
-    fn from_property(data: &[u8], in_type: TdhInType) -> Result<Self> {
+    fn from_property(data: &[u8], in_type: TdhInType, _: TdhOutType) -> Result<Self> {
         match in_type {
             TdhInType::FileTime => {
                 // Zero-extend truncated data (ETW may truncate trailing zeros)
@@ -2179,7 +2230,7 @@ impl FromProperty for Timestamp {
 }
 
 impl FromProperty for Guid {
-    fn from_property(data: &[u8], in_type: TdhInType) -> Result<Self> {
+    fn from_property(data: &[u8], in_type: TdhInType, _: TdhOutType) -> Result<Self> {
         match in_type {
             TdhInType::Guid => {
                 if data.len() < 16 {
@@ -2228,7 +2279,7 @@ const fn counted_string_len(data: &[u8], in_type: TdhInType) -> u16 {
 }
 
 impl FromProperty for Sid {
-    fn from_property(data: &[u8], in_type: TdhInType) -> Result<Self> {
+    fn from_property(data: &[u8], in_type: TdhInType, _: TdhOutType) -> Result<Self> {
         match in_type {
             TdhInType::WbemSid => {
                 // Skip TOKEN_USER header to reach the SID.
@@ -2237,7 +2288,7 @@ impl FromProperty for Sid {
                 if data.len() <= hdr {
                     return Err(Error::parse("Insufficient data for WbemSid"));
                 }
-                Self::from_property(&data[hdr..], TdhInType::Sid)
+                Self::from_property(&data[hdr..], TdhInType::Sid, TdhOutType::Null)
             }
             TdhInType::Sid => {
                 if data.len() < 8 {
@@ -2461,8 +2512,9 @@ mod tests {
             }),
         ];
         for (in_type, data) in cases {
-            let borrowed = String::from_property(&data, in_type);
-            let owned = WideString::from_property(&data, in_type).and_then(|w| w.decode_utf16());
+            let borrowed = String::from_property(&data, in_type, TdhOutType::Null);
+            let owned = WideString::from_property(&data, in_type, TdhOutType::Null)
+                .and_then(|w| w.decode_utf16());
             assert_eq!(
                 borrowed.as_deref().ok(),
                 owned.as_deref().ok(),
@@ -2490,11 +2542,11 @@ mod tests {
         ];
         for (in_type, data) in cases {
             assert!(
-                String::from_property(&data, in_type).is_err(),
+                String::from_property(&data, in_type, TdhOutType::Null).is_err(),
                 "{in_type:?}: malformed input must not decode to a String"
             );
             assert!(
-                WideString::from_property(&data, in_type).is_err(),
+                WideString::from_property(&data, in_type, TdhOutType::Null).is_err(),
                 "{in_type:?}: owned path must also reject it (invariant both share)"
             );
         }
@@ -2547,108 +2599,132 @@ mod tests {
     #[test]
     fn test_from_property_int8() {
         let data = [0xFE]; // -2 as i8
-        let result = i8::from_property(&data, TdhInType::Int8).expect("parse should succeed");
+        let result = i8::from_property(&data, TdhInType::Int8, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, -2);
     }
 
     #[test]
     fn test_from_property_uint8() {
         let data = [0x42];
-        let result = u8::from_property(&data, TdhInType::UInt8).expect("parse should succeed");
+        let result = u8::from_property(&data, TdhInType::UInt8, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, 0x42);
     }
 
     #[test]
     fn test_from_property_int16() {
         let data = [0xFE, 0xFF]; // -2 as i16 (little-endian)
-        let result = i16::from_property(&data, TdhInType::Int16).expect("parse should succeed");
+        let result = i16::from_property(&data, TdhInType::Int16, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, -2);
     }
 
     #[test]
     fn test_from_property_uint16() {
         let data = [0x34, 0x12]; // 0x1234
-        let result = u16::from_property(&data, TdhInType::UInt16).expect("parse should succeed");
+        let result = u16::from_property(&data, TdhInType::UInt16, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, 0x1234);
     }
 
     #[test]
     fn test_from_property_int32() {
         let data = [0xFE, 0xFF, 0xFF, 0xFF]; // -2 as i32
-        let result = i32::from_property(&data, TdhInType::Int32).expect("parse should succeed");
+        let result = i32::from_property(&data, TdhInType::Int32, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, -2);
     }
 
     #[test]
     fn test_from_property_uint32() {
         let data = [0x78, 0x56, 0x34, 0x12]; // 0x12345678
-        let result = u32::from_property(&data, TdhInType::UInt32).expect("parse should succeed");
+        let result = u32::from_property(&data, TdhInType::UInt32, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, 0x12345678);
     }
 
     #[test]
     fn test_from_property_hexint32() {
         let data = [0xEF, 0xBE, 0xAD, 0xDE]; // 0xDEADBEEF
-        let result = u32::from_property(&data, TdhInType::HexInt32).expect("parse should succeed");
+        let result = u32::from_property(&data, TdhInType::HexInt32, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, 0xDEADBEEF);
     }
 
     #[test]
     fn test_from_property_int64() {
         let data = [0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]; // -2 as i64
-        let result = i64::from_property(&data, TdhInType::Int64).expect("parse should succeed");
+        let result = i64::from_property(&data, TdhInType::Int64, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, -2);
     }
 
     #[test]
     fn test_from_property_uint64() {
         let data = [0xEF, 0xCD, 0xAB, 0x90, 0x78, 0x56, 0x34, 0x12];
-        let result = u64::from_property(&data, TdhInType::UInt64).expect("parse should succeed");
+        let result = u64::from_property(&data, TdhInType::UInt64, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, 0x1234567890ABCDEF);
     }
 
     #[test]
     fn test_from_property_hexint64() {
         let data = [0xEF, 0xBE, 0xAD, 0xDE, 0xEF, 0xBE, 0xAD, 0xDE];
-        let result = u64::from_property(&data, TdhInType::HexInt64).expect("parse should succeed");
+        let result = u64::from_property(&data, TdhInType::HexInt64, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, 0xDEADBEEFDEADBEEF);
     }
 
     #[test]
     fn test_from_property_float() {
         let data = 1.5f32.to_le_bytes();
-        let result = f32::from_property(&data, TdhInType::Float).expect("parse should succeed");
+        let result = f32::from_property(&data, TdhInType::Float, TdhOutType::Null)
+            .expect("parse should succeed");
         assert!((result - 1.5).abs() < 0.001);
     }
 
     #[test]
     fn test_from_property_double() {
         let data = 123.456789012345f64.to_le_bytes();
-        let result = f64::from_property(&data, TdhInType::Double).expect("parse should succeed");
+        let result = f64::from_property(&data, TdhInType::Double, TdhOutType::Null)
+            .expect("parse should succeed");
         assert!((result - 123.456789012345).abs() < 0.0000001);
     }
 
     #[test]
     fn test_from_property_bool_1byte() {
-        assert!(!bool::from_property(&[0], TdhInType::Boolean).expect("parse should succeed"));
-        assert!(bool::from_property(&[1], TdhInType::Boolean).expect("parse should succeed"));
-        assert!(bool::from_property(&[0xFF], TdhInType::Boolean).expect("parse should succeed"));
+        assert!(
+            !bool::from_property(&[0], TdhInType::Boolean, TdhOutType::Null)
+                .expect("parse should succeed")
+        );
+        assert!(
+            bool::from_property(&[1], TdhInType::Boolean, TdhOutType::Null)
+                .expect("parse should succeed")
+        );
+        assert!(
+            bool::from_property(&[0xFF], TdhInType::Boolean, TdhOutType::Null)
+                .expect("parse should succeed")
+        );
     }
 
     #[test]
     fn test_from_property_bool_4byte() {
         assert!(
-            !bool::from_property(&[0, 0, 0, 0], TdhInType::Boolean).expect("parse should succeed")
+            !bool::from_property(&[0, 0, 0, 0], TdhInType::Boolean, TdhOutType::Null)
+                .expect("parse should succeed")
         );
         assert!(
-            bool::from_property(&[1, 0, 0, 0], TdhInType::Boolean).expect("parse should succeed")
+            bool::from_property(&[1, 0, 0, 0], TdhInType::Boolean, TdhOutType::Null)
+                .expect("parse should succeed")
         );
     }
 
     #[test]
     fn test_from_property_pointer() {
         let data = [0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70];
-        let result = usize::from_property(&data, TdhInType::Pointer).expect("parse should succeed");
+        let result = usize::from_property(&data, TdhInType::Pointer, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, 0x7060504030201000usize);
     }
 
@@ -2661,7 +2737,8 @@ mod tests {
             0x78, 0x56, // data3
             0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56, 0x78, 0x90, // data4
         ];
-        let result = Guid::from_property(&data, TdhInType::Guid).expect("parse should succeed");
+        let result = Guid::from_property(&data, TdhInType::Guid, TdhOutType::Null)
+            .expect("parse should succeed");
         let expected = Guid::from_u128(0x12345678_1234_5678_abcd_ef1234567890);
         assert_eq!(result, expected);
     }
@@ -2674,7 +2751,8 @@ mod tests {
             0x78, 0x56, // data3
             0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56, 0x78, 0x90, // data4
         ];
-        let guid = Guid::from_property(&data, TdhInType::Guid).expect("parse should succeed");
+        let guid = Guid::from_property(&data, TdhInType::Guid, TdhOutType::Null)
+            .expect("parse should succeed");
 
         // Test Display
         assert_eq!(guid.to_string(), "12345678-1234-5678-abcd-ef1234567890");
@@ -2692,13 +2770,13 @@ mod tests {
         let data = ticks.to_le_bytes();
 
         // Test with FileTime type
-        let result =
-            Timestamp::from_property(&data, TdhInType::FileTime).expect("parse should succeed");
+        let result = Timestamp::from_property(&data, TdhInType::FileTime, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result.raw(), ticks);
         assert_eq!(result.as_unix_ms(), 1000); // 1 second = 1000ms
 
         // UInt64 is no longer accepted — use FileTime explicitly
-        assert!(Timestamp::from_property(&data, TdhInType::UInt64).is_err());
+        assert!(Timestamp::from_property(&data, TdhInType::UInt64, TdhOutType::Null).is_err());
     }
 
     #[test]
@@ -2714,8 +2792,8 @@ mod tests {
             0x2D, 0x00, // second: 45
             0x7B, 0x00, // milliseconds: 123
         ];
-        let result =
-            SystemTime::from_property(&data, TdhInType::SystemTime).expect("parse should succeed");
+        let result = SystemTime::from_property(&data, TdhInType::SystemTime, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result.year, 2024);
         assert_eq!(result.month, 6);
         assert_eq!(result.day, 15);
@@ -2735,7 +2813,8 @@ mod tests {
             0x15, 0x00, 0x00, 0x00, // sub-auth[0]: 21 (BUILTIN_DOMAIN)
             0xD2, 0x02, 0x96, 0x49, // sub-auth[1]: 1234567890
         ];
-        let result = Sid::from_property(&data, TdhInType::Sid).expect("parse should succeed");
+        let result = Sid::from_property(&data, TdhInType::Sid, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result.revision, 1);
         assert_eq!(result.sub_authorities.len(), 2);
         assert_eq!(result.sub_authorities[0], 21);
@@ -2746,8 +2825,8 @@ mod tests {
     #[test]
     fn test_from_property_binary() {
         let data = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
-        let result =
-            Vec::<u8>::from_property(&data, TdhInType::Binary).expect("parse should succeed");
+        let result = Vec::<u8>::from_property(&data, TdhInType::Binary, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, vec![0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE]);
     }
 
@@ -2755,15 +2834,15 @@ mod tests {
     fn test_from_property_unicode_string() {
         // "Test" in UTF-16LE with null terminator
         let data = [0x54, 0x00, 0x65, 0x00, 0x73, 0x00, 0x74, 0x00, 0x00, 0x00];
-        let result =
-            String::from_property(&data, TdhInType::UnicodeString).expect("parse should succeed");
+        let result = String::from_property(&data, TdhInType::UnicodeString, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, "Test");
     }
 
     #[test]
     fn test_from_property_ansi_string() {
         let data = b"Hello\0";
-        let result = AnsiString::from_property(data, TdhInType::AnsiString)
+        let result = AnsiString::from_property(data, TdhInType::AnsiString, TdhOutType::Null)
             .expect("parse should succeed")
             .to_string_lossy();
         assert_eq!(result, "Hello");
@@ -2773,7 +2852,7 @@ mod tests {
     #[cfg_attr(miri, ignore = "calls MultiByteToWideChar (Win32)")]
     fn test_string_accepts_ansi_string() {
         let data = b"Hello\0";
-        let result = String::from_property(data, TdhInType::AnsiString)
+        let result = String::from_property(data, TdhInType::AnsiString, TdhOutType::Null)
             .expect("String::from_property should accept AnsiString via CP_ACP");
         assert_eq!(result, "Hello");
     }
@@ -2782,8 +2861,8 @@ mod tests {
     fn test_from_property_counted_string() {
         // Byte count = 8 (4 chars × 2), "Test" in UTF-16LE
         let data = [0x08, 0x00, 0x54, 0x00, 0x65, 0x00, 0x73, 0x00, 0x74, 0x00];
-        let result =
-            String::from_property(&data, TdhInType::CountedString).expect("parse should succeed");
+        let result = String::from_property(&data, TdhInType::CountedString, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, "Test");
     }
 
@@ -2806,8 +2885,8 @@ mod tests {
         }
 
         // The value decodes exactly, with no trailing garbage.
-        let decoded =
-            String::from_property(&field, TdhInType::CountedString).expect("should decode");
+        let decoded = String::from_property(&field, TdhInType::CountedString, TdhOutType::Null)
+            .expect("should decode");
         assert_eq!(decoded, path);
 
         // The length consumes exactly prefix + byte_count and no more — appending
@@ -2853,7 +2932,7 @@ mod tests {
             "length calc",
         );
         assert_rejects_parity(
-            String::from_property(&data, TdhInType::CountedString),
+            String::from_property(&data, TdhInType::CountedString, TdhOutType::Null),
             "owned decoder",
         );
         assert_rejects_parity(
@@ -2880,9 +2959,10 @@ mod tests {
     fn test_from_property_counted_ansi_string() {
         // Length: 5 bytes, "Hello"
         let data = [0x05, 0x00, b'H', b'e', b'l', b'l', b'o'];
-        let result = AnsiString::from_property(&data, TdhInType::CountedAnsiString)
-            .expect("parse should succeed")
-            .to_string_lossy();
+        let result =
+            AnsiString::from_property(&data, TdhInType::CountedAnsiString, TdhOutType::Null)
+                .expect("parse should succeed")
+                .to_string_lossy();
         assert_eq!(result, "Hello");
     }
 
@@ -2895,7 +2975,8 @@ mod tests {
     fn test_truncated_u32_from_0_bytes() {
         // Entirely missing field - should return 0
         let data: [u8; 0] = [];
-        let result = u32::from_property(&data, TdhInType::UInt32).expect("parse should succeed");
+        let result = u32::from_property(&data, TdhInType::UInt32, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, 0);
     }
 
@@ -2903,21 +2984,24 @@ mod tests {
     fn test_truncated_u32_from_1_byte() {
         // Only lowest byte present
         let data = [0x42];
-        let result = u32::from_property(&data, TdhInType::UInt32).expect("parse should succeed");
+        let result = u32::from_property(&data, TdhInType::UInt32, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, 0x42);
     }
 
     #[test]
     fn test_truncated_u32_from_2_bytes() {
         let data = [0x34, 0x12];
-        let result = u32::from_property(&data, TdhInType::UInt32).expect("parse should succeed");
+        let result = u32::from_property(&data, TdhInType::UInt32, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, 0x1234);
     }
 
     #[test]
     fn test_truncated_u32_from_3_bytes() {
         let data = [0x56, 0x34, 0x12];
-        let result = u32::from_property(&data, TdhInType::UInt32).expect("parse should succeed");
+        let result = u32::from_property(&data, TdhInType::UInt32, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, 0x123456);
     }
 
@@ -2925,7 +3009,8 @@ mod tests {
     fn test_truncated_u64_from_partial() {
         // Only 4 bytes present for a u64
         let data = [0x78, 0x56, 0x34, 0x12];
-        let result = u64::from_property(&data, TdhInType::UInt64).expect("parse should succeed");
+        let result = u64::from_property(&data, TdhInType::UInt64, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, 0x12345678);
     }
 
@@ -2933,7 +3018,8 @@ mod tests {
     fn test_truncated_bool_from_0_bytes() {
         // Empty data = false
         let data: [u8; 0] = [];
-        let result = bool::from_property(&data, TdhInType::Boolean).expect("parse should succeed");
+        let result = bool::from_property(&data, TdhInType::Boolean, TdhOutType::Null)
+            .expect("parse should succeed");
         assert!(!result);
     }
 
@@ -2941,7 +3027,8 @@ mod tests {
     fn test_truncated_bool_from_1_byte() {
         // Single byte TRUE
         let data = [1];
-        let result = bool::from_property(&data, TdhInType::Boolean).expect("parse should succeed");
+        let result = bool::from_property(&data, TdhInType::Boolean, TdhOutType::Null)
+            .expect("parse should succeed");
         assert!(result);
     }
 
@@ -2949,7 +3036,8 @@ mod tests {
     fn test_truncated_pointer_from_0_bytes() {
         // Empty data = null pointer
         let data: [u8; 0] = [];
-        let result = usize::from_property(&data, TdhInType::Pointer).expect("parse should succeed");
+        let result = usize::from_property(&data, TdhInType::Pointer, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, 0);
     }
 
@@ -2957,7 +3045,8 @@ mod tests {
     fn test_truncated_pointer_from_4_bytes() {
         // Lower 4 bytes of pointer
         let data = [0x78, 0x56, 0x34, 0x12];
-        let result = usize::from_property(&data, TdhInType::Pointer).expect("parse should succeed");
+        let result = usize::from_property(&data, TdhInType::Pointer, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, 0x12345678);
     }
 
@@ -2965,8 +3054,8 @@ mod tests {
     fn test_truncated_string_from_0_bytes() {
         // Empty data = empty string
         let data: [u8; 0] = [];
-        let result =
-            String::from_property(&data, TdhInType::UnicodeString).expect("parse should succeed");
+        let result = String::from_property(&data, TdhInType::UnicodeString, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, "");
     }
 
@@ -2974,8 +3063,8 @@ mod tests {
     fn test_string_without_null_terminator() {
         // "Hi" in UTF-16LE without null terminator (ETW truncated it)
         let data = [0x48, 0x00, 0x69, 0x00];
-        let result =
-            String::from_property(&data, TdhInType::UnicodeString).expect("parse should succeed");
+        let result = String::from_property(&data, TdhInType::UnicodeString, TdhOutType::Null)
+            .expect("parse should succeed");
         assert_eq!(result, "Hi");
     }
 
@@ -2984,9 +3073,10 @@ mod tests {
         use std::os::windows::ffi::OsStrExt;
         // "H", lone high surrogate, null terminator
         let data = [0x48, 0x00, 0x00, 0xD8, 0x00, 0x00];
-        assert!(String::from_property(&data, TdhInType::UnicodeString).is_err());
-        let result = std::ffi::OsString::from_property(&data, TdhInType::UnicodeString)
-            .expect("parse should succeed");
+        assert!(String::from_property(&data, TdhInType::UnicodeString, TdhOutType::Null).is_err());
+        let result =
+            std::ffi::OsString::from_property(&data, TdhInType::UnicodeString, TdhOutType::Null)
+                .expect("parse should succeed");
         assert_eq!(result.encode_wide().collect::<Vec<_>>(), [0x48, 0xD800]);
     }
 
@@ -2995,22 +3085,25 @@ mod tests {
         // byte count 4, then "Hi"
         let data = [0x04, 0x00, 0x48, 0x00, 0x69, 0x00];
         for in_type in [TdhInType::CountedString, TdhInType::ManifestCountedString] {
-            let result =
-                std::ffi::OsString::from_property(&data, in_type).expect("parse should succeed");
+            let result = std::ffi::OsString::from_property(&data, in_type, TdhOutType::Null)
+                .expect("parse should succeed");
             assert_eq!(result, "Hi");
         }
     }
 
     #[test]
     fn test_os_string_from_property_rejects_ansi() {
-        assert!(std::ffi::OsString::from_property(b"Hi\0", TdhInType::AnsiString).is_err());
+        assert!(
+            std::ffi::OsString::from_property(b"Hi\0", TdhInType::AnsiString, TdhOutType::Null)
+                .is_err()
+        );
     }
 
     #[test]
     fn test_ansi_string_without_null_terminator() {
         // "Hi" without null terminator
         let data = b"Hi";
-        let result = AnsiString::from_property(data, TdhInType::AnsiString)
+        let result = AnsiString::from_property(data, TdhInType::AnsiString, TdhOutType::Null)
             .expect("parse should succeed")
             .to_string_lossy();
         assert_eq!(result, "Hi");
@@ -3024,56 +3117,58 @@ mod tests {
     #[test]
     fn test_strict_u32_rejects_int32() {
         let data = [0xFF, 0xFF, 0xFF, 0xFF];
-        assert!(u32::from_property(&data, TdhInType::Int32).is_err());
+        assert!(u32::from_property(&data, TdhInType::Int32, TdhOutType::Null).is_err());
     }
 
     #[test]
     fn test_strict_i32_rejects_uint32() {
         let data = [0xFF, 0xFF, 0xFF, 0xFF];
-        assert!(i32::from_property(&data, TdhInType::UInt32).is_err());
+        assert!(i32::from_property(&data, TdhInType::UInt32, TdhOutType::Null).is_err());
     }
 
     #[test]
     fn test_strict_u64_rejects_int64() {
         let data = [0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
-        assert!(u64::from_property(&data, TdhInType::Int64).is_err());
+        assert!(u64::from_property(&data, TdhInType::Int64, TdhOutType::Null).is_err());
     }
 
     #[test]
     fn test_strict_i64_rejects_uint64() {
         let data = [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80];
-        assert!(i64::from_property(&data, TdhInType::UInt64).is_err());
+        assert!(i64::from_property(&data, TdhInType::UInt64, TdhOutType::Null).is_err());
     }
 
     #[test]
     fn test_strict_i32_rejects_hexint32() {
         let data = [0xEF, 0xBE, 0xAD, 0xDE];
-        assert!(i32::from_property(&data, TdhInType::HexInt32).is_err());
+        assert!(i32::from_property(&data, TdhInType::HexInt32, TdhOutType::Null).is_err());
     }
 
     #[test]
     fn test_strict_u16_rejects_int16() {
         let data = [0xFE, 0xFF];
-        assert!(u16::from_property(&data, TdhInType::Int16).is_err());
+        assert!(u16::from_property(&data, TdhInType::Int16, TdhOutType::Null).is_err());
     }
 
     #[test]
     fn test_strict_i8_rejects_uint8() {
         let data = [0x80];
-        assert!(i8::from_property(&data, TdhInType::UInt8).is_err());
+        assert!(i8::from_property(&data, TdhInType::UInt8, TdhOutType::Null).is_err());
     }
 
     #[test]
     fn test_u32_accepts_hexint32() {
         let data = [0xEF, 0xBE, 0xAD, 0xDE];
-        let result = u32::from_property(&data, TdhInType::HexInt32).expect("should succeed");
+        let result = u32::from_property(&data, TdhInType::HexInt32, TdhOutType::Null)
+            .expect("should succeed");
         assert_eq!(result, 0xDEADBEEF);
     }
 
     #[test]
     fn test_u64_accepts_hexint64() {
         let data = [0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80];
-        let result = u64::from_property(&data, TdhInType::HexInt64).expect("should succeed");
+        let result = u64::from_property(&data, TdhInType::HexInt64, TdhOutType::Null)
+            .expect("should succeed");
         assert_eq!(result, 0x8000_0000_0000_0001);
     }
 
@@ -3287,7 +3382,7 @@ mod tests {
     #[test]
     fn test_ansi_string_to_string_lossy_cp1252() {
         let data = [0x80, 0x99, 0x00]; // €™ + null
-        let result = AnsiString::from_property(&data, TdhInType::AnsiString)
+        let result = AnsiString::from_property(&data, TdhInType::AnsiString, TdhOutType::Null)
             .expect("parse should succeed")
             .to_string_lossy();
         assert_eq!(result, "€™");
@@ -3296,7 +3391,7 @@ mod tests {
     #[test]
     fn test_ansi_string_to_string_lossy_ascii() {
         let data = b"Hello\0";
-        let result = AnsiString::from_property(data, TdhInType::AnsiString)
+        let result = AnsiString::from_property(data, TdhInType::AnsiString, TdhOutType::Null)
             .expect("parse should succeed")
             .to_string_lossy();
         assert_eq!(result, "Hello");
@@ -3432,8 +3527,11 @@ mod tests {
 
     #[test]
     fn test_wide_string_manifest_counted_too_short() {
-        let r =
-            crate::types::WideString::from_property(&[0x01u8], TdhInType::ManifestCountedString);
+        let r = crate::types::WideString::from_property(
+            &[0x01u8],
+            TdhInType::ManifestCountedString,
+            TdhOutType::Null,
+        );
         assert!(r.is_err());
     }
 
@@ -3443,6 +3541,7 @@ mod tests {
         let r = crate::types::WideString::from_property(
             &[0x03u8, 0x00, 0x48, 0x00, 0x69],
             TdhInType::ManifestCountedString,
+            TdhOutType::Null,
         );
         assert!(r.is_err());
     }
@@ -3453,6 +3552,7 @@ mod tests {
         let s = crate::types::WideString::from_property(
             &[0x04u8, 0x00, 0x48, 0x00, 0x69, 0x00],
             TdhInType::ManifestCountedString,
+            TdhOutType::Null,
         )
         .unwrap();
         assert_eq!(s.to_string_lossy(), "Hi");
@@ -3463,6 +3563,7 @@ mod tests {
         let r = crate::types::AnsiString::from_property(
             &[0x01u8],
             TdhInType::ManifestCountedAnsiString,
+            TdhOutType::Null,
         );
         assert!(r.is_err());
     }
@@ -3472,6 +3573,7 @@ mod tests {
         let s = crate::types::AnsiString::from_property(
             &[0x02u8, 0x00, 0x48, 0x69],
             TdhInType::ManifestCountedAnsiString,
+            TdhOutType::Null,
         )
         .unwrap();
         assert_eq!(s.to_string_lossy(), "Hi");
@@ -3479,7 +3581,8 @@ mod tests {
 
     #[test]
     fn test_ansi_string_unsupported_type() {
-        let r = crate::types::AnsiString::from_property(&[0u8; 4], TdhInType::UInt32);
+        let r =
+            crate::types::AnsiString::from_property(&[0u8; 4], TdhInType::UInt32, TdhOutType::Null);
         assert!(r.is_err());
     }
 
@@ -3491,19 +3594,19 @@ mod tests {
     fn test_u32_from_property_zero_extends_truncated_data() {
         // Only 2 bytes provided for a UInt32 — the slow path zero-extends.
         // Bytes [0x42, 0x00] → 0x00000042 = 66 after zero-extension.
-        let v = u32::from_property(&[0x42u8, 0x00], TdhInType::UInt32).unwrap();
+        let v = u32::from_property(&[0x42u8, 0x00], TdhInType::UInt32, TdhOutType::Null).unwrap();
         assert_eq!(v, 0x42);
     }
 
     #[test]
     fn test_u32_from_property_unsupported_type_errors() {
-        let r = u32::from_property(&[0u8; 4], TdhInType::UnicodeString);
+        let r = u32::from_property(&[0u8; 4], TdhInType::UnicodeString, TdhOutType::Null);
         assert!(r.is_err());
     }
 
     #[test]
     fn test_u64_from_property_zero_extends_truncated_data() {
-        let v = u64::from_property(&[0xAAu8, 0xBB], TdhInType::UInt64).unwrap();
+        let v = u64::from_property(&[0xAAu8, 0xBB], TdhInType::UInt64, TdhOutType::Null).unwrap();
         assert_eq!(v, 0xBBAA);
     }
 }
@@ -3664,6 +3767,44 @@ mod position_tests {
         let mut parser = EventParser::from_raw_parts(&data, &schema, &mut cache);
         let val: AnsiStrRef = parser.as_ref("Target").unwrap();
         assert_eq!(val.to_string_lossy(), "reftest");
+    }
+
+    /// "café" in UTF-8, null-terminated. Any ANSI code page reads the last two
+    /// bytes as something other than "é", so only a UTF-8 decode yields "café".
+    const UTF8_CAFE: &[u8] = &[0x63, 0x61, 0x66, 0xC3, 0xA9, 0x00];
+
+    #[test]
+    #[cfg_attr(miri, ignore = "calls MultiByteToWideChar (Win32)")]
+    fn dynamic_ansi_string_decodes_by_out_type() {
+        for out_type in [TdhOutType::Utf8, TdhOutType::Json, TdhOutType::Xml] {
+            let (schema, mut cache) = MockSchemaBuilder::new()
+                .add("Prefix", TdhInType::UInt32, TdhOutType::Null)
+                .add("Target", TdhInType::AnsiString, out_type)
+                .build_with_cache();
+            let mut data = 0u32.to_le_bytes().to_vec();
+            data.extend_from_slice(UTF8_CAFE);
+
+            let mut parser = EventParser::from_raw_parts(&data, &schema, &mut cache);
+            let via_get: String = parser.get("Target").unwrap();
+            assert_eq!(via_get, "café", "get, out-type {out_type:?}");
+
+            let mut parser = EventParser::from_raw_parts(&data, &schema, &mut cache);
+            let via_hint: String = parser.get_hinted("Target", 1).unwrap();
+            assert_eq!(via_hint, "café", "get_hinted, out-type {out_type:?}");
+
+            let mut parser = EventParser::from_raw_parts(&data, &schema, &mut cache);
+            let target = parser.properties().unwrap().nth(1).unwrap();
+            assert_eq!(target.out_type(), out_type);
+            assert_eq!(target.to_string(), "café", "Display, out-type {out_type:?}");
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "calls MultiByteToWideChar (Win32)")]
+    fn utf8_out_type_rejects_invalid_utf8() {
+        // 0xE9 is "é" in Windows-1252 but a truncated sequence in UTF-8.
+        let data = [0x63, 0x61, 0x66, 0xE9, 0x00];
+        assert!(String::from_property(&data, TdhInType::AnsiString, TdhOutType::Utf8).is_err());
     }
 
     #[test]

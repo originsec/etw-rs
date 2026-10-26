@@ -198,6 +198,23 @@ impl TdhOutType {
         };
         v as u16
     }
+
+    /// The code page an ANSI string property with this out-type is encoded in.
+    ///
+    /// `Utf8`, `Json` and `Xml` mean UTF-8 (`<tdh.h>`; an XML document may override
+    /// that with its own `encoding` attribute, which is not consulted here). Every
+    /// other out-type means the provider's ANSI code page. The event does not record
+    /// which code page that was, so this assumes the local
+    /// [`CP_ACP`](windows_sys::Win32::Globalization::CP_ACP) — right for events
+    /// produced on this machine.
+    #[must_use]
+    pub const fn ansi_code_page(self) -> u32 {
+        use windows_sys::Win32::Globalization::{CP_ACP, CP_UTF8};
+        match self {
+            Self::Utf8 | Self::Json | Self::Xml => CP_UTF8,
+            _ => CP_ACP,
+        }
+    }
 }
 
 /// TDH input type constants.
@@ -3135,6 +3152,21 @@ mod tests {
     // =========================================================================
     // TdhOutType / TdhInType round-trip coverage
     // =========================================================================
+
+    #[test]
+    fn ansi_code_page_follows_out_type() {
+        use windows_sys::Win32::Globalization::{CP_ACP, CP_UTF8};
+        for utf8 in [TdhOutType::Utf8, TdhOutType::Json, TdhOutType::Xml] {
+            assert_eq!(utf8.ansi_code_page(), CP_UTF8, "{utf8:?}");
+        }
+        for acp in [
+            TdhOutType::Null,
+            TdhOutType::String,
+            TdhOutType::Unknown(999),
+        ] {
+            assert_eq!(acp.ansi_code_page(), CP_ACP, "{acp:?}");
+        }
+    }
 
     #[test]
     fn tdh_out_type_round_trip_all_variants() {

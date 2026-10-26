@@ -925,10 +925,13 @@ fn resolve_fields(fields: &[EventFieldInfo]) -> FieldResolution {
         }
 
         if let Some(rt) = intype_to_rust_type(field, fields) {
-            let rust_type = match tdh_annotation(field.in_type) {
+            let mut rust_type = match tdh_annotation(field.in_type) {
                 Some(tdh) => format!("{rt} @ tdh({tdh})"),
                 None => rt,
             };
+            if let Some(out) = out_annotation(field.in_type, field.out_type) {
+                rust_type = format!("{rust_type} @ out({out})");
+            }
             emittable.push(ResolvedField {
                 name,
                 rust_type,
@@ -961,6 +964,20 @@ const fn tdh_annotation(in_type: u16) -> Option<&'static str> {
         21 => Some("HexInt64"),
         306 => Some("UnicodeChar"),
         307 => Some("AnsiChar"),
+        _ => None,
+    }
+}
+
+/// TDH out-types that make an ANSI string UTF-8 rather than the provider's code page.
+///
+/// Only these are emitted: every other out-type on an ANSI string decodes the same
+/// as the default, so annotating it would add noise and no behaviour.
+const fn out_annotation(in_type: u16, out_type: u16) -> Option<&'static str> {
+    match (in_type, out_type) {
+        // AnsiString, ManifestCountedAnsiString
+        (2 | 23, 28) => Some("Xml"),
+        (2 | 23, 34) => Some("Json"),
+        (2 | 23, 35) => Some("Utf8"),
         _ => None,
     }
 }
@@ -2983,5 +3000,48 @@ fn emit_diff_fields(output: &mut String, prev: &CommentVersionOutput, curr: &Com
             type_w = if ann.is_empty() { 0 } else { max_type },
         )
         .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EventFieldInfo, FieldResolution, resolve_fields};
+
+    fn field(name: &str, in_type: u16, out_type: u16) -> EventFieldInfo {
+        EventFieldInfo {
+            name: name.to_owned(),
+            in_type,
+            out_type,
+            flags: 0,
+            length_property_index: None,
+            count: 1,
+            count_property_index: None,
+            length: 0,
+            struct_byte_size: None,
+        }
+    }
+
+    #[test]
+    fn utf8_ansi_out_types_are_annotated() {
+        let FieldResolution::Resolved { emittable, .. } = resolve_fields(&[
+            field("Utf8", 2, 35),
+            field("Json", 23, 34),
+            field("Xml", 2, 28),
+            field("Plain", 2, 1),
+            field("Wide", 1, 35),
+        ]) else {
+            panic!("fields should resolve");
+        };
+        let types: Vec<_> = emittable.into_iter().map(|f| f.rust_type).collect();
+        assert_eq!(
+            types,
+            [
+                "AnsiStrRef @ out(Utf8)",
+                "CountedAnsiStrRef @ out(Json)",
+                "AnsiStrRef @ out(Xml)",
+                "AnsiStrRef",
+                "WideStrRef",
+            ]
+        );
     }
 }

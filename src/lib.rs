@@ -81,6 +81,18 @@ pub mod types;
 /// | `@ count("Field")` | element count comes from another field |
 /// | `@ count_bytes("Field", N)` | element count times a fixed element size |
 /// | `@ tdh(InType)` | the field's TDH in-type |
+/// | `@ out(OutType)` | an ANSI string field's TDH out-type: `String`, `Xml`, `Json` or `Utf8` |
+///
+/// `@ out(...)` decides how the owned accessor of an `AnsiStrRef` or
+/// `CountedAnsiStrRef` field decodes it: `Utf8`, `Json` and `Xml` are UTF-8,
+/// anything else (and no annotation) the ANSI code page
+/// ([`TdhOutType::ansi_code_page`]). `validate_schema` fails a field whose
+/// annotation disagrees with the manifest, so a missing `@ out(Utf8)` is caught
+/// rather than silently decoded as the wrong encoding.
+///
+/// ```text
+/// EventName: AnsiStrRef @ out(Utf8),
+/// ```
 ///
 /// `@ tdh(...)` changes no parsing — the field is read exactly as its Rust type
 /// says. It states which TDH in-type the manifest specifies, which the Rust type
@@ -896,6 +908,24 @@ pub enum SchemaMismatch {
         expected: &'static str,
         /// Type TDH reports.
         actual: &'static str,
+    },
+
+    /// An ANSI string field's declared out-type implies a different encoding
+    /// from the TDH `OutType` — one is UTF-8, the other the provider's code
+    /// page — so the static accessor would decode it wrongly.
+    #[error(
+        "field {index} ('{field}') out-type mismatch: expected {expected:?}, got {actual:?} \
+         (add or correct its @ out(...))"
+    )]
+    FieldOutType {
+        /// Zero-based field position.
+        index: usize,
+        /// The field's name.
+        field: &'static str,
+        /// Out-type the static schema declares.
+        expected: TdhOutType,
+        /// Out-type TDH reports.
+        actual: TdhOutType,
     },
 
     /// A field's TDH property flags lack bits its declared layout requires

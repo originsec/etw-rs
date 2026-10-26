@@ -54,6 +54,11 @@ pub(crate) struct FieldDef {
     /// type fixes the wire layout, not the meaning, so without this the crate has to
     /// guess a representative and `validate_schema` can only match by group.
     pub(crate) tdh: Option<String>,
+    /// TDH out-type from `@ out(...)`, on ANSI string fields only.
+    ///
+    /// It decides the encoding: `Utf8`, `Json` and `Xml` are UTF-8, anything else
+    /// is the provider's code page. Absent means `String`, the in-type's default.
+    pub(crate) out: Option<String>,
 }
 
 /// Field offset strategy.
@@ -219,6 +224,9 @@ const TDH_IN_TYPES: &[&str] = &[
     "Struct",
 ];
 
+/// The out-types `winmeta.xml` permits on an ANSI string, which `@ out(...)` accepts.
+const ANSI_OUT_TYPES: &[&str] = &["String", "Xml", "Json", "Utf8"];
+
 impl EventSchema {
     /// Parse the fields section.
     pub(crate) fn parse_fields(input: ParseStream) -> syn::Result<Vec<FieldDef>> {
@@ -231,11 +239,45 @@ impl EventSchema {
             let field_type: Type = input.parse()?;
 
             // Any number of `@` annotations, in any order: at most one offset
-            // specification, and at most one `@ tdh(...)`.
+            // specification, at most one `@ tdh(...)` and at most one `@ out(...)`.
             let mut offset = None;
             let mut tdh = None;
+            let mut out = None;
             while input.peek(Token![@]) {
                 input.parse::<Token![@]>()?;
+
+                let is_out = input.fork().parse::<Ident>().is_ok_and(|i| i == "out");
+                if is_out {
+                    let keyword: Ident = input.parse()?;
+                    let content;
+                    syn::parenthesized!(content in input);
+                    let name: Ident = content.parse()?;
+                    let name = name.to_string();
+                    if !ANSI_OUT_TYPES.contains(&name.as_str()) {
+                        return Err(syn::Error::new(
+                            content.span(),
+                            format!(
+                                "unsupported out-type '{name}'; an ANSI string accepts: {}",
+                                ANSI_OUT_TYPES.join(", ")
+                            ),
+                        ));
+                    }
+                    if !is_ansi_string_type(&field_type)
+                        && !is_counted_ansi_string_type(&field_type)
+                    {
+                        return Err(syn::Error::new(
+                            keyword.span(),
+                            "@ out(...) applies only to AnsiStrRef and CountedAnsiStrRef fields",
+                        ));
+                    }
+                    if out.replace(name).is_some() {
+                        return Err(syn::Error::new(
+                            input.span(),
+                            "duplicate @ out(...) annotation on one field",
+                        ));
+                    }
+                    continue;
+                }
 
                 let is_tdh = input.fork().parse::<Ident>().is_ok_and(|i| i == "tdh");
                 if is_tdh {
@@ -305,7 +347,7 @@ impl EventSchema {
                     } else {
                         return Err(syn::Error::new(
                             ident.span(),
-                            "expected 'length(\"FieldName\")', 'fixed_length(N)', 'count(\"FieldName\")', 'count_bytes(\"FieldName\", N)', or 'tdh(InType)'",
+                            "expected 'length(\"FieldName\")', 'fixed_length(N)', 'count(\"FieldName\")', 'count_bytes(\"FieldName\", N)', 'tdh(InType)', or 'out(OutType)'",
                         ));
                     }
                 };
@@ -332,6 +374,7 @@ impl EventSchema {
                 ty: field_type,
                 offset,
                 tdh,
+                out,
             });
 
             // Consume trailing comma if present
@@ -479,10 +522,13 @@ fn generate_validation_module(schema: &EventSchema) -> TokenStream2 {
                 quote! { None }
             };
             let required_flags = offset_required_flags(&field.offset);
+            let out_type_token = ansi_out_type(field)
+                .map_or_else(|| quote! { None }, |out_type| quote! { Some(#out_type) });
             quote! {
                 ::etw::static_schema::StaticFieldInfo {
                     name: #name,
                     expected_tdh_type: #tdh_type_token,
+                    expected_out_type: #out_type_token,
                     required_property_flags: #required_flags,
                 }
             }
@@ -1955,6 +2001,16 @@ pub(crate) fn is_ref_accessor(field: &FieldDef) -> bool {
         || is_counted_binary_type(&field.ty)
 }
 
+/// The `::etw::TdhOutType` an ANSI string field decodes by: its `@ out(...)`, else
+/// `String`. `None` for every other field.
+pub(crate) fn ansi_out_type(field: &FieldDef) -> Option<TokenStream2> {
+    if !is_ansi_string_type(&field.ty) && !is_counted_ansi_string_type(&field.ty) {
+        return None;
+    }
+    let variant = Ident::new(field.out.as_deref().unwrap_or("String"), Span::call_site());
+    Some(quote! { ::etw::TdhOutType::#variant })
+}
+
 /// Generate the owned wrapper method for a ref-type field accessor.
 ///
 /// The owned wrapper calls `self.{name}_ref()?` and converts to the owned type.
@@ -1968,14 +2024,11 @@ fn gen_owned_wrapper(owned_name: &Ident, field: &FieldDef) -> Option<TokenStream
                 Ok(self.#ref_name()?.to_os_string())
             }
         })
-    } else if is_ansi_string_type(&field.ty) || is_counted_ansi_string_type(&field.ty) {
+    } else if let Some(out_type) = ansi_out_type(field) {
         Some(quote! {
             #[inline]
             pub fn #owned_name(&mut self) -> ::etw::Result<String> {
-                // Decode using the process active code page (CP_ACP).
-                // Use the _ref() accessor and call .decode(codepage) explicitly
-                // if the event source uses a different code page.
-                self.#ref_name()?.decode(::etw::CP_ACP)
+                self.#ref_name()?.decode(#out_type.ansi_code_page())
             }
         })
     } else if is_sid_type(&field.ty) || is_wbem_sid_type(&field.ty) {
@@ -2203,6 +2256,50 @@ mod tests {
                 .parse_str("When: u64 @ tdh(FileTime) @ tdh(UInt64),")
                 .is_err(),
             "two @ tdh(...) on one field should not compile"
+        );
+    }
+
+    #[test]
+    fn out_annotation_selects_the_ansi_decode() {
+        let fields =
+            parse("A: AnsiStrRef @ out(Utf8), B: CountedAnsiStrRef @ out(Json), C: AnsiStrRef,");
+        assert_eq!(fields[0].out.as_deref(), Some("Utf8"));
+        assert_eq!(fields[1].out.as_deref(), Some("Json"));
+        let default = super::ansi_out_type(&fields[2])
+            .expect("ANSI field")
+            .to_string();
+        assert!(
+            default.ends_with("String"),
+            "unannotated ANSI decodes as String: {default}"
+        );
+    }
+
+    #[test]
+    fn out_annotation_rejects_an_out_type_an_ansi_string_cannot_have() {
+        let msg = match EventSchema::parse_fields.parse_str("A: AnsiStrRef @ out(Port),") {
+            Ok(_) => panic!("Port is not an ANSI string out-type"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("Port") && msg.contains("Utf8"), "{msg}");
+    }
+
+    #[test]
+    fn out_annotation_rejects_a_field_that_is_not_an_ansi_string() {
+        for src in ["W: WideStrRef @ out(Utf8),", "N: u16 @ out(String),"] {
+            assert!(
+                EventSchema::parse_fields.parse_str(src).is_err(),
+                "@ out(...) on a non-ANSI field should not compile: {src}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_out_annotations_are_rejected() {
+        assert!(
+            EventSchema::parse_fields
+                .parse_str("A: AnsiStrRef @ out(Utf8) @ out(Json),")
+                .is_err(),
+            "two @ out(...) on one field should not compile"
         );
     }
 

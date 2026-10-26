@@ -89,7 +89,7 @@
 
 use crate::{
     Error, Result,
-    types::{AnsiStrRef, Guid, SidRef, SystemTime, WideStrRef},
+    types::{AnsiStrRef, Guid, SidRef, SystemTime, TdhOutType, WideStrRef},
 };
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1091,6 +1091,10 @@ pub struct StaticFieldInfo {
     /// Expected TDH InType name (e.g., "UInt32", "UnicodeString").
     /// `None` for fields that don't have a direct TDH mapping (e.g., struct arrays).
     pub expected_tdh_type: Option<&'static str>,
+    /// Out-type an ANSI string field decodes by, from its `@ out(...)` (default
+    /// `String`). Compared by [`TdhOutType::ansi_code_page`], not exactly. `None`
+    /// for every other field.
+    pub expected_out_type: Option<TdhOutType>,
     /// TDH property flags the field's declared layout requires TDH to report:
     /// `PropertyStruct` (0x1), `PropertyParamLength` (0x2),
     /// `PropertyParamCount` (0x4). Zero when the layout implies none.
@@ -1440,6 +1444,24 @@ fn validate_single_version(
                         }),
                     });
                 }
+            }
+        }
+
+        if let Some(expected) = field_info.expected_out_type
+            && (flags & 0x1) == 0
+        {
+            // SAFETY: non-struct property — nonStructType is the active union variant.
+            let actual = TdhOutType::from_raw(unsafe { prop.Anonymous1.nonStructType.OutType });
+            if expected.ansi_code_page() != actual.ansi_code_page() {
+                return Err(crate::Error::SchemaValidationError {
+                    context,
+                    mismatch: Box::new(crate::SchemaMismatch::FieldOutType {
+                        index: idx,
+                        field: field_info.name,
+                        expected,
+                        actual,
+                    }),
+                });
             }
         }
     }
@@ -2232,81 +2254,97 @@ mod tests {
                 StaticFieldInfo {
                     name: "ProcessID",
                     expected_tdh_type: Some("UInt32"),
+                    expected_out_type: None,
                     required_property_flags: 0,
                 },
                 StaticFieldInfo {
                     name: "ProcessSequenceNumber",
                     expected_tdh_type: Some("UInt64"),
+                    expected_out_type: None,
                     required_property_flags: 0,
                 },
                 StaticFieldInfo {
                     name: "CreateTime",
                     expected_tdh_type: Some("FileTime"),
+                    expected_out_type: None,
                     required_property_flags: 0,
                 },
                 StaticFieldInfo {
                     name: "ParentProcessID",
                     expected_tdh_type: Some("UInt32"),
+                    expected_out_type: None,
                     required_property_flags: 0,
                 },
                 StaticFieldInfo {
                     name: "ParentProcessSequenceNumber",
                     expected_tdh_type: Some("UInt64"),
+                    expected_out_type: None,
                     required_property_flags: 0,
                 },
                 StaticFieldInfo {
                     name: "SessionID",
                     expected_tdh_type: Some("UInt32"),
+                    expected_out_type: None,
                     required_property_flags: 0,
                 },
                 StaticFieldInfo {
                     name: "Flags",
                     expected_tdh_type: Some("UInt32"),
+                    expected_out_type: None,
                     required_property_flags: 0,
                 },
                 StaticFieldInfo {
                     name: "ProcessTokenElevationType",
                     expected_tdh_type: Some("UInt32"),
+                    expected_out_type: None,
                     required_property_flags: 0,
                 },
                 StaticFieldInfo {
                     name: "ProcessTokenIsElevated",
                     expected_tdh_type: Some("UInt32"),
+                    expected_out_type: None,
                     required_property_flags: 0,
                 },
                 StaticFieldInfo {
                     name: "MandatoryLabel",
                     expected_tdh_type: Some("SID"),
+                    expected_out_type: None,
                     required_property_flags: 0,
                 },
                 StaticFieldInfo {
                     name: "ImageName",
                     expected_tdh_type: Some("UnicodeString"),
+                    expected_out_type: None,
                     required_property_flags: 0,
                 },
                 StaticFieldInfo {
                     name: "ImageChecksum",
                     expected_tdh_type: Some("UInt32"),
+                    expected_out_type: None,
                     required_property_flags: 0,
                 },
                 StaticFieldInfo {
                     name: "TimeDateStamp",
                     expected_tdh_type: Some("UInt32"),
+                    expected_out_type: None,
                     required_property_flags: 0,
                 },
                 StaticFieldInfo {
                     name: "PackageFullName",
                     expected_tdh_type: Some("UnicodeString"),
+                    expected_out_type: None,
                     required_property_flags: 0,
                 },
                 StaticFieldInfo {
                     name: "PackageRelativeAppId",
                     expected_tdh_type: Some("UnicodeString"),
+                    expected_out_type: None,
                     required_property_flags: 0,
                 },
                 StaticFieldInfo {
                     name: "SecurityMitigations",
                     expected_tdh_type: Some("UInt32"),
+                    expected_out_type: None,
                     required_property_flags: 0,
                 },
             ]

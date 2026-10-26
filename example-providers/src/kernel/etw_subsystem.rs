@@ -93,10 +93,10 @@ etw::provider_schema! {
             id: 31,
             name: "LostTraceLoggingEvent",
             version { 0, fields: { // Since Windows 11 21H2
-                ProviderId: Guid,        // [0] GUID
-                StatusCode: u32,         // [1] UInt32
-                EventName: AnsiStrRef,   // [2] AnsiString
-                SessionName: WideStrRef, // [3] UnicodeString
+                ProviderId: Guid,                  // [0] GUID
+                StatusCode: u32,                   // [1] UInt32
+                EventName: AnsiStrRef @ out(Utf8), // [2] AnsiString
+                SessionName: WideStrRef,           // [3] UnicodeString
             }}
         }
 

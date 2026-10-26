@@ -123,7 +123,8 @@ fn main() -> etw::Result<()> {
                 // Note: ETW has two string types - UTF-16LE unicode strings (wide strings) and ANSI
                 // strings. Wide strings convert losslessly to `OsString`, since Windows permits
                 // unpaired surrogates that a UTF-8 `String` cannot hold. ANSI strings convert to
-                // `String` using the active code page, propagating any decoding errors.
+                // `String` using the encoding their out-type implies — UTF-8 for `@ out(Utf8)`,
+                // otherwise the active code page — propagating any decoding errors.
                 let image_name = parser.ImageName()?.display().to_string();
 
                 // SecurityMitigations was added in V4 — use a version check or handle

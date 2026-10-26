@@ -610,10 +610,13 @@ pub(crate) fn generate_validate_schema_method(event: &MultiVersionEvent) -> Toke
                         quote! { None }
                     };
                     let required_flags = crate::schema::offset_required_flags(&field.offset);
+                    let out_type_token = crate::schema::ansi_out_type(field)
+                        .map_or_else(|| quote! { None }, |out_type| quote! { Some(#out_type) });
                     quote! {
                         ::etw::static_schema::StaticFieldInfo {
                             name: #name,
                             expected_tdh_type: #tdh_type_token,
+                            expected_out_type: #out_type_token,
                             required_property_flags: #required_flags,
                         }
                     }

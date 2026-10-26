@@ -195,7 +195,8 @@ fn handle_lost_trace_logging_event(
 ) -> etw::Result<()> {
     let mut parser = etw_subsystem::LostTraceLoggingEventParser::new(event, context)?;
     let provider = parser.ProviderId()?;
-    // EventName is ANSI — the `String` conversion decodes it with the active code page.
+    // EventName is an ANSI string whose out-type is Utf8 (`@ out(Utf8)` in its schema),
+    // so the `String` conversion decodes it as UTF-8 rather than the active code page.
     let name = parser.EventName()?;
     let session = parser.SessionName()?;
     println!(

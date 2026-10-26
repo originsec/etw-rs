@@ -48,6 +48,7 @@ Per-property costs are rough averages over the [BENCHMARKS.md](../BENCHMARKS.md)
 ### Parser Cache State Machine
 - Properties split into fixed prefix (cached once per schema) and variable suffix (recomputed per event).
 - `current_offset` tracks the next unparsed byte. If it gets out of sync, all subsequent properties read garbage.
+- The out-type is not cached in `PropertyLocation`. `get()` reads it from the schema only when `FromProperty::reads_out_type` says the type needs it for that in-type (today `String` on an ANSI string). Caching it in each location measured 4–9% slower on `get()`.
 - A property's length is per element: its size is length × element count, whether each comes from the schema or from another property (`PropertyParamLength` / `PropertyParamCount`). Measured against TDH by the `ParamLengthAndCount` and `ParamLengthStaticCount` differential fixtures.
 
 ### ETW Truncation Handling

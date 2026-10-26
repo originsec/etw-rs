@@ -59,7 +59,8 @@ one — via `TdhInType::fixed_size(pointer_size)`. The static parser reads them 
 impl. `u32` rejects both.
 
 The static column lists the Rust type a field of that InType is declared as; `@ tdh(...)` pins the
-exact InType where one Rust type covers several (e.g. `u64 @ tdh(FileTime)`).
+exact InType where one Rust type covers several (e.g. `u64 @ tdh(FileTime)`). An ANSI string field
+may also carry `@ out(...)` — see [TdhOutType Decoding](#tdhouttype-decoding).
 
 ### Variable-Size Types
 
@@ -104,6 +105,25 @@ Every prefix in this table counts **bytes**, not characters — including the UT
 | `UnicodeChar` | 306 | 2 bytes, or a declared-length WCHAR array. No `FromProperty` impl; `Display` decodes every code unit as UTF-16, so NUL padding in an array is shown, not trimmed. Static: `u16`. No manifest registered on Windows 11 26200 declares this in-type (973 providers scanned), so whether real MOF or TraceLogging events pad it is unverified. |
 | `AnsiChar` | 307 | 1 byte. No `FromProperty` impl; `Display` shows hex bytes. Static: `u8`. |
 | `HexDump` | 309 | No `FromProperty` impl and no size rule: needs a declared length. `Display` shows hex bytes. |
+
+---
+
+## TdhOutType Decoding
+
+The out-type changes the *value* of one group of fields: ANSI strings. `<tdh.h>` decodes
+`*AnsiString` with an `Xml`, `Json` or `Utf8` out-type as UTF-8, and anything else with the
+provider's ANSI code page (`TdhOutType::ansi_code_page`). The event does not record the provider's
+code page, so the crate uses the local `CP_ACP`.
+
+| Path | Where the out-type comes from |
+|------|-------------------------------|
+| Dynamic `get::<String>()` | The schema's `OutType`, read only for ANSI in-types (`FromProperty::reads_out_type`) |
+| Static owned accessor | The field's `@ out(...)`, which `generate-provider` emits for those three out-types |
+| `Property` `Display` | The schema's `OutType`; UTF-8 out-types decode lossily as UTF-8 |
+
+`validate_schema` compares a static ANSI field's `@ out(...)` with the manifest by encoding, so an
+annotation that is missing or wrong fails validation. Borrowed `AnsiStrRef` values carry raw bytes;
+`AnsiStrRef::decode` takes the code page explicitly.
 
 ---
 
@@ -219,7 +239,7 @@ linkage fixtures in `tests/differential_offline.rs`.
 | Static sequential offset caching | `tests/static_schema_parser_struct.rs` |
 | Multi-version `provider_schema!` | `tests/static_schema_multi_version.rs` |
 | Static parse helpers, `FromBytes`, `tdh_types_compatible` | `src/static_schema.rs` (`tests`) |
-| `event_schema!` field parsing (`@ tdh(...)`, offsets) | `etw-rs-macros/src/schema.rs` |
+| `event_schema!` field parsing (`@ tdh(...)`, `@ out(...)`, offsets) | `etw-rs-macros/src/schema.rs` |
 
 ### Coverage Gaps
 

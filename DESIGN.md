@@ -440,6 +440,8 @@ ETW uses UTF-16 (wide strings) extensively. Design:
   returns it — because Windows permits unpaired surrogates that `String` cannot hold
 - Conversion to Rust `String` on request, via `FromProperty for String` or
   `WideStrRef::decode_utf16`
+- ANSI strings decode by their TDH out-type: `Utf8`, `Json` and `Xml` are UTF-8,
+  anything else the ANSI code page. Static schemas declare it with `@ out(...)`
 
 ### 5. Win32 Bindings
 

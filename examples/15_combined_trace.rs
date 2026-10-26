@@ -18,7 +18,7 @@
 //! cargo run --example 15_combined_trace
 //! ```
 
-use etw::{SidRef, Trace, WideStrRef, system_logger::masks::PERF_NO_SYSCONFIG};
+use etw::{Sid, Trace, system_logger::masks::PERF_NO_SYSCONFIG};
 use example_providers::{classic::process as system_process, kernel::process as kernel_process};
 use std::{thread::sleep, time::Duration};
 
@@ -42,21 +42,22 @@ fn main() -> etw::Result<()> {
         {
             let mut parser = context.parser(event)?;
             let pid: u32 = parser.get("ProcessId")?;
-            let cmdline: String = parser
-                .as_ref::<WideStrRef>("CommandLine")?
-                .to_string_lossy();
-            println!("[+] SystemLogger   pid:{pid} {cmdline}");
+            // Only the classic event includes the command line and user SID
+            let sid: Sid = parser.get("UserSID")?;
+            let cmdline: String = parser.get("CommandLine")?;
+            println!("[+] SystemLogger   pid:{pid} sid:{sid} {cmdline}");
         }
 
         if event.provider_guid() == kernel_process::GUID
             && event.id() == kernel_process::event::PROCESS_START
         {
             let mut parser = context.parser(event)?;
-
             let pid: u32 = parser.get("ProcessID")?;
+            let image_name: String = parser.get("ImageName")?;
+            // Only the modern event includes the sequence number and integrity
+            // Note: EVENT_HEADER_EXT_TYPE_SID logs the creator thread's SID
             let sequence: u64 = parser.get("ProcessSequenceNumber")?;
-            let integrity: String = parser.as_ref::<SidRef>("MandatoryLabel")?.to_string();
-            let image_name: String = parser.as_ref::<WideStrRef>("ImageName")?.to_string_lossy();
+            let integrity: Sid = parser.get("MandatoryLabel")?;
             println!(
                 "[+] Kernel-Process pid:{pid} sequence:{sequence} integrity:{integrity} {image_name}"
             );

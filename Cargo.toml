@@ -172,6 +172,10 @@ path = "examples/13_system_logger_rundown.rs"
 name = "14_system_providers"
 path = "examples/14_system_providers.rs"
 
+[[example]]
+name = "15_combined_trace"
+path = "examples/15_combined_trace.rs"
+
 [lints]
 workspace = true
 

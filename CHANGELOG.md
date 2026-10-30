@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `validate_schema` fails a field whose annotation disagrees
   (`SchemaMismatch::FieldOutType`).
 - `TdhOutType::ansi_code_page()` maps an out-type to the code page an ANSI string is in.
+- `WideStrRef::starts_with_ascii_ignore_case()`, `ends_with_ascii_ignore_case()` and
+  `contains_ascii_ignore_case()` match a borrowed UTF-16 string without allocating, for
+  filtering on names such as file paths.
 
 ### Changed
 

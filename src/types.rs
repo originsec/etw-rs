@@ -878,55 +878,89 @@ impl<'a> WideStrRef<'a> {
     }
 
     /// Check if the string starts with an ASCII prefix.
+    ///
+    /// Returns `false` if `prefix` contains non-ASCII characters.
     #[must_use]
     pub fn starts_with_ascii(&self, prefix: &str) -> bool {
-        if !prefix.is_ascii() || self.len() < prefix.len() {
-            return false;
-        }
-        self.data[..prefix.len() * 2]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .zip(prefix.bytes())
-            .all(|(wide, ascii)| wide[0] == ascii && wide[1] == 0)
+        self.ascii_at(0, prefix, false)
+    }
+
+    /// Check if the string starts with an ASCII prefix, ignoring ASCII case.
+    ///
+    /// Returns `false` if `prefix` contains non-ASCII characters.
+    #[must_use]
+    pub fn starts_with_ascii_ignore_case(&self, prefix: &str) -> bool {
+        self.ascii_at(0, prefix, true)
     }
 
     /// Check if the string ends with an ASCII suffix.
+    ///
+    /// Returns `false` if `suffix` contains non-ASCII characters.
     #[must_use]
     pub fn ends_with_ascii(&self, suffix: &str) -> bool {
-        if !suffix.is_ascii() || self.len() < suffix.len() {
-            return false;
-        }
-        let start = self.data.len() - suffix.len() * 2;
-        self.data[start..]
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .zip(suffix.bytes())
-            .all(|(wide, ascii)| wide[0] == ascii && wide[1] == 0)
+        self.len()
+            .checked_sub(suffix.len())
+            .is_some_and(|start| self.ascii_at(start, suffix, false))
+    }
+
+    /// Check if the string ends with an ASCII suffix, ignoring ASCII case.
+    ///
+    /// Returns `false` if `suffix` contains non-ASCII characters.
+    #[must_use]
+    pub fn ends_with_ascii_ignore_case(&self, suffix: &str) -> bool {
+        self.len()
+            .checked_sub(suffix.len())
+            .is_some_and(|start| self.ascii_at(start, suffix, true))
     }
 
     /// Check if the string contains an ASCII substring.
+    ///
+    /// Returns `false` if `needle` contains non-ASCII characters.
     #[must_use]
     pub fn contains_ascii(&self, needle: &str) -> bool {
-        if !needle.is_ascii() || self.len() < needle.len() {
+        self.contains_ascii_impl(needle, false)
+    }
+
+    /// Check if the string contains an ASCII substring, ignoring ASCII case.
+    ///
+    /// Returns `false` if `needle` contains non-ASCII characters.
+    #[must_use]
+    pub fn contains_ascii_ignore_case(&self, needle: &str) -> bool {
+        self.contains_ascii_impl(needle, true)
+    }
+
+    fn contains_ascii_impl(&self, needle: &str, ignore_case: bool) -> bool {
+        let Some(last_start) = self.len().checked_sub(needle.len()) else {
+            return false;
+        };
+        // O(n*m), fine for the short needles filters use.
+        (0..=last_start).any(|start| self.ascii_at(start, needle, ignore_case))
+    }
+
+    /// Whether the code units starting at `start` (in units) spell `ascii`.
+    ///
+    /// A unit matches only if its high byte is zero, so no non-ASCII
+    /// character can compare equal to an ASCII one.
+    fn ascii_at(&self, start: usize, ascii: &str, ignore_case: bool) -> bool {
+        if !ascii.is_ascii() {
             return false;
         }
-        if needle.is_empty() {
-            return true;
-        }
-        // Simple O(n*m) search — could be optimised
-        let needle_bytes = needle.as_bytes();
-        'outer: for i in 0..=(self.len() - needle.len()) {
-            for (j, &ascii) in needle_bytes.iter().enumerate() {
-                let idx = (i + j) * 2;
-                if self.data[idx] != ascii || self.data[idx + 1] != 0 {
-                    continue 'outer;
-                }
-            }
-            return true;
-        }
-        false
+        let Some(units) = self.data.get(start * 2..(start + ascii.len()) * 2) else {
+            return false;
+        };
+        units
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .zip(ascii.bytes())
+            .all(|(wide, byte)| {
+                wide[1] == 0
+                    && if ignore_case {
+                        wide[0].eq_ignore_ascii_case(&byte)
+                    } else {
+                        wide[0] == byte
+                    }
+            })
     }
 }
 
@@ -2306,6 +2340,54 @@ mod tests {
         let bytes = make_wide_str("hi");
         let w = WideStrRef::new(&bytes);
         assert!(!w.contains_ascii("hello world"));
+    }
+
+    #[test]
+    fn wide_str_ref_ascii_ignore_case_affixes() {
+        let bytes = make_wide_str(r"\Device\HarddiskVolume3\Windows\System32\NTDLL.dll");
+        let w = WideStrRef::new(&bytes);
+        assert!(w.starts_with_ascii_ignore_case(r"\device\"));
+        assert!(w.ends_with_ascii_ignore_case(r"\ntdll.DLL"));
+        assert!(w.contains_ascii_ignore_case("system32"));
+        assert!(
+            !w.starts_with_ascii(r"\device\"),
+            "case-sensitive form must still differ"
+        );
+        assert!(!w.ends_with_ascii(r"\ntdll.dll"));
+        assert!(!w.contains_ascii("system32"));
+
+        assert!(w.starts_with_ascii_ignore_case(""));
+        assert!(w.ends_with_ascii_ignore_case(""));
+        assert!(w.contains_ascii_ignore_case(""));
+        assert!(!w.ends_with_ascii_ignore_case("much longer than the path itself, by a lot"));
+        assert!(
+            !w.contains_ascii_ignore_case("syst\u{e9}m"),
+            "a non-ASCII needle never matches"
+        );
+    }
+
+    #[test]
+    fn wide_str_ref_ascii_methods_ignore_non_ascii_units_with_ascii_low_bytes() {
+        // U+0141 'Ł' is 41 01: its low byte is 'A'. Only the high byte keeps
+        // it from matching, in both case modes.
+        let w = WideStrRef::new(&[0x41, 0x01, 0x42, 0x00]);
+        for ignore_case in [false, true] {
+            let (starts, ends, contains) = if ignore_case {
+                (
+                    w.starts_with_ascii_ignore_case("a"),
+                    w.ends_with_ascii_ignore_case("ab"),
+                    w.contains_ascii_ignore_case("a"),
+                )
+            } else {
+                (
+                    w.starts_with_ascii("A"),
+                    w.ends_with_ascii("AB"),
+                    w.contains_ascii("A"),
+                )
+            };
+            assert!(!starts && !ends && !contains, "ignore_case={ignore_case}");
+        }
+        assert!(w.ends_with_ascii_ignore_case("b"));
     }
 
     // =========================================================================

@@ -59,12 +59,14 @@ fn test_system_object_events() {
 
         // Try to get object type from the event
         let obj_type = if let Ok(mut parser) = context.parser(event) {
-            parser.get::<String>("ObjectType").unwrap_or_default()
+            parser
+                .get::<std::ffi::OsString>("ObjectType")
+                .unwrap_or_default()
         } else {
-            String::new()
+            std::ffi::OsString::new()
         };
 
-        println!("{op} event captured (type: {obj_type})");
+        println!("{op} event captured (type: {})", obj_type.display());
         event_captured_clone.store(true, Ordering::Relaxed);
         Ok(())
     });

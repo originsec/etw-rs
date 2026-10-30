@@ -67,8 +67,9 @@ fn make_mock_event(
 fn bench_type_parsing(c: &mut Criterion) {
     use etw::{
         parser::FromProperty,
-        types::{AnsiString, TdhInType, TdhOutType, WideString},
+        types::{AnsiString, TdhInType, TdhOutType},
     };
+    use std::ffi::OsString;
 
     let mut group = c.benchmark_group("type_parsing");
 
@@ -128,7 +129,7 @@ fn bench_type_parsing(c: &mut Criterion) {
         .collect();
     group.bench_function("unicode_string_short", |b| {
         b.iter(|| {
-            let result: WideString = FromProperty::from_property(
+            let result: OsString = FromProperty::from_property(
                 bb(unicode_str.as_slice()),
                 TdhInType::UnicodeString,
                 TdhOutType::Null,
@@ -149,7 +150,7 @@ fn bench_type_parsing(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(unicode_long.len() as u64));
     group.bench_function("unicode_string_long", |b| {
         b.iter(|| {
-            let result: WideString = FromProperty::from_property(
+            let result: OsString = FromProperty::from_property(
                 bb(unicode_long.as_slice()),
                 TdhInType::UnicodeString,
                 TdhOutType::Null,

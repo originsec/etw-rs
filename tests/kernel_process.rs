@@ -37,7 +37,8 @@ struct StartFields {
     pid: u32,
     parent_pid: u32,
     create_time: Timestamp,
-    image_name: String,
+    // UTF-16 in ProcessStart; ProcessStop's is ANSI, hence the different types.
+    image_name: std::ffi::OsString,
 }
 
 struct StopFields {
@@ -146,7 +147,11 @@ fn test_kernel_process_parses_u32_filetime_and_strings() {
 
     // WideStrRef (Unicode string): full NT device path ending with the binary name.
     assert!(
-        start.image_name.to_lowercase().ends_with("cmd.exe"),
+        start
+            .image_name
+            .to_string_lossy()
+            .to_lowercase()
+            .ends_with("cmd.exe"),
         "ProcessStart.ImageName {:?} does not end with 'cmd.exe'",
         start.image_name
     );

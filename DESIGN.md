@@ -257,7 +257,7 @@ struct ParserCache {
 **Type Naming Convention**:
 | Type | Reference (zero-copy) | Owned |
 |------|----------------------|-------|
-| UTF-16 | `WideStrRef<'a>` | `WideString` |
+| UTF-16 | `WideStrRef<'a>` | `OsString` |
 | ANSI | `AnsiStrRef<'a>` | `AnsiString` |
 | SID | `SidRef<'a>` | `Sid` |
 
@@ -435,11 +435,12 @@ trace.set_event_callback(|event, context| {
 
 ETW uses UTF-16 (wide strings) extensively. Design:
 - Zero-copy borrowed views (`WideStrRef`, `AnsiStrRef`) into the event buffer
-- Owned types (`WideString`, `AnsiString`) when the data must outlive the callback
-- Wide strings convert to `OsString` by default — the static schema's owned accessor
-  returns it — because Windows permits unpaired surrogates that `String` cannot hold
-- Conversion to Rust `String` on request, via `FromProperty for String` or
-  `WideStrRef::decode_utf16`
+- Owned types (`OsString`, `AnsiString`) when the data must outlive the callback
+- A wide string's lossless owned form is `OsString`, which the static owned accessor
+  returns, because Windows permits unpaired surrogates that `String` cannot hold.
+  `get::<String>()` is the convenience form and decodes lossily (U+FFFD), so distinct
+  names can collide; `WideStrRef::decode_utf16` is the strict conversion
+- `WideString` remains for building UTF-16 arguments to Win32, not as a parse target
 - ANSI strings decode by their TDH out-type: `Utf8`, `Json` and `Xml` are UTF-8,
   anything else the ANSI code page. Static schemas declare it with `@ out(...)`
 

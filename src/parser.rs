@@ -18,8 +18,8 @@
 //!
 //! | Return type      | `get`              | `as_ref`           |
 //! |------------------|:------------------:|:------------------:|
-//! | `String`         | yes (Unicode + ANSI via CP_ACP) | —           |
-//! | `WideString`     | yes                | —                  |
+//! | `OsString`       | yes (Unicode)      | —                  |
+//! | `String`         | yes (Unicode lossy) | —                 |
 //! | `AnsiString`     | yes                | —                  |
 //! | `WideStrRef`     | —                  | yes                |
 //! | `AnsiStrRef`     | —                  | yes                |
@@ -43,7 +43,7 @@
 //! use etw::types::WideStrRef;
 //!
 //! let pid: u32 = parser.get("ProcessId")?;
-//! let name: String = parser.get("ImageName")?;
+//! let name: std::ffi::OsString = parser.get("ImageName")?;
 //!
 //! // Zero-copy API
 //! let name: WideStrRef = parser.as_ref("QueryName")?;
@@ -57,7 +57,6 @@ use crate::{
     processing_context::EventSchema,
     types::{
         AnsiStrRef, AnsiString, Guid, Sid, SidRef, SystemTime, TdhInType, TdhOutType, WideStrRef,
-        WideString,
     },
 };
 use windows_sys::Win32::{Globalization::CP_UTF8, System::SystemServices::SID_MAX_SUB_AUTHORITIES};
@@ -225,12 +224,6 @@ impl<'a> Property<'a> {
     #[inline]
     pub fn as_wide_str(&self) -> Result<WideStrRef<'a>> {
         WideStrRef::from_property_ref(self.data, self.in_type)
-    }
-
-    /// Returns the property as an owned UTF-16 string.
-    #[inline]
-    pub fn to_wide_string(&self) -> Result<WideString> {
-        WideString::from_property(self.data, self.in_type, self.out_type)
     }
 
     /// Returns the property as a u32.
@@ -793,7 +786,7 @@ impl<'a> EventParser<'a> {
     /// ```no_run
     /// # fn example(parser: &mut etw::EventParser) -> etw::Result<()> {
     /// let pid: u32 = parser.get("ProcessId")?;
-    /// let name: String = parser.get("ImageName")?;
+    /// let name: std::ffi::OsString = parser.get("ImageName")?;
     /// # Ok(())
     /// # }
     /// ```
@@ -1774,8 +1767,8 @@ impl std::fmt::Debug for EventParser<'_> {
 /// Trait for types that can be parsed from a property buffer.
 ///
 /// Implemented by all types that [`EventParser::get`] and [`EventParser::get_hinted`]
-/// can return, including primitives, [`WideString`], [`AnsiString`], `OsString`
-/// and `String`.
+/// can return, including primitives, [`AnsiString`], `OsString` (wide strings)
+/// and `String` (lossy for wide strings: an unpaired surrogate becomes U+FFFD).
 ///
 /// Assumes 64-bit event data (this crate supports only x86_64 and aarch64).
 pub trait FromProperty: Sized {
@@ -1832,13 +1825,10 @@ pub trait FromPropertyRef<'a>: Sized {
 
 /// Slices the UTF-16 payload out of a wide-string property.
 ///
-/// Applies the counted-prefix rules only; null-terminator handling is left to
-/// the caller because the owned and borrowing decoders express it differently.
-///
-/// Shared by `FromProperty for WideString` and `FromProperty for String` so the
-/// two cannot drift. That matters most for malformed input: a truncated or
-/// odd-length counted prefix must stay an error in both, not become a silently
-/// empty string.
+/// Applies the counted-prefix rules only; the caller handles the terminator.
+/// Unlike [`WideStrRef::from_property_ref`], a truncated or odd-length counted
+/// prefix is an error here, not a silently empty string: event payloads are
+/// attacker-influenceable, and an owned value should not paper over that.
 fn wide_string_payload(data: &[u8], in_type: TdhInType) -> Result<&[u8]> {
     match in_type {
         TdhInType::UnicodeString | TdhInType::NonNullTerminatedString => Ok(data),
@@ -1870,14 +1860,8 @@ fn wide_string_payload(data: &[u8], in_type: TdhInType) -> Result<&[u8]> {
             Ok(&data[2..end])
         }
         _ => Err(Error::parse(format!(
-            "Cannot parse WideString from {in_type:?}"
+            "Cannot parse OsString from {in_type:?}"
         ))),
-    }
-}
-
-impl FromProperty for WideString {
-    fn from_property(data: &[u8], in_type: TdhInType, _: TdhOutType) -> Result<Self> {
-        Ok(Self::from_bytes(wide_string_payload(data, in_type)?))
     }
 }
 
@@ -1912,19 +1896,10 @@ impl FromProperty for AnsiString {
 }
 
 impl FromProperty for std::ffi::OsString {
-    fn from_property(data: &[u8], in_type: TdhInType, out_type: TdhOutType) -> Result<Self> {
-        match in_type {
-            TdhInType::UnicodeString
-            | TdhInType::NonNullTerminatedString
-            | TdhInType::CountedString
-            | TdhInType::ReversedCountedString
-            | TdhInType::ManifestCountedString => {
-                Ok(WideString::from_property(data, in_type, out_type)?.to_os_string())
-            }
-            _ => Err(Error::parse(format!(
-                "Cannot parse OsString from {in_type:?}"
-            ))),
-        }
+    fn from_property(data: &[u8], in_type: TdhInType, _: TdhOutType) -> Result<Self> {
+        let payload = wide_string_payload(data, in_type)?;
+        let end = WideStrRef::null_terminated_len(payload);
+        Ok(WideStrRef::new(&payload[..end]).to_os_string())
     }
 }
 
@@ -1942,27 +1917,17 @@ impl FromProperty for String {
 
     fn from_property(data: &[u8], in_type: TdhInType, out_type: TdhOutType) -> Result<Self> {
         match in_type {
+            // Lossy: an unpaired surrogate, which Windows permits but UTF-8
+            // cannot hold, becomes U+FFFD. Distinct names can therefore collide;
+            // `OsString` keeps them apart.
             TdhInType::UnicodeString
             | TdhInType::NonNullTerminatedString
             | TdhInType::CountedString
             | TdhInType::ReversedCountedString
             | TdhInType::ManifestCountedString => {
-                // Decode straight out of the event buffer. Going via
-                // `WideString` copies the UTF-16 payload into a `Vec<u16>`
-                // purely to decode it, and `WideStrRef::decode_utf16` also
-                // takes an aligned fast path the owned form cannot. Mirrors
-                // what the AnsiString arm below already does.
-                //
-                // Slicing comes from the same `wide_string_payload` the owned
-                // impl uses, and `null_terminated_len` applies the terminator
-                // rule `WideString::from_bytes` does, so this is a pure
-                // allocation saving: same output, and the same errors on
-                // malformed input. Both decode via the strict
-                // `String::from_utf16`, so a lone surrogate still errors rather
-                // than being replaced.
                 let payload = wide_string_payload(data, in_type)?;
                 let end = WideStrRef::null_terminated_len(payload);
-                WideStrRef::new(&payload[..end]).decode_utf16()
+                Ok(WideStrRef::new(&payload[..end]).to_string_lossy())
             }
             // Borrow via AnsiStrRef to avoid copying the bytes into an owned
             // AnsiString before decoding.
@@ -2476,13 +2441,11 @@ mod tests {
     use super::*;
     use crate::types::decode_cp1252;
 
-    /// `String` decodes wide properties from a borrow of the event buffer while
-    /// `WideString` copies first. That is meant to be an allocation saving and
-    /// nothing more, so the two must agree on every wide `in_type` -- including
-    /// the null-terminator rule, which differs between the borrowing and owned
-    /// constructors and is easy to get wrong.
+    /// Every wide `in_type` decodes to the same `OsString` and `String` once its
+    /// counted prefix and terminator are handled. Both share that slicing, so
+    /// they cannot disagree on well-formed input.
     #[test]
-    fn string_matches_widestring_on_wellformed_wide_input() {
+    fn wide_strings_decode_the_same_for_every_wellformed_in_type() {
         let wide = |s: &str| -> Vec<u8> { s.encode_utf16().flat_map(u16::to_le_bytes).collect() };
         let cases: [(TdhInType, Vec<u8>); 5] = [
             // Trailing null: both must strip exactly one code unit.
@@ -2504,14 +2467,10 @@ mod tests {
             }),
         ];
         for (in_type, data) in cases {
-            let borrowed = String::from_property(&data, in_type, TdhOutType::Null);
-            let owned = WideString::from_property(&data, in_type, TdhOutType::Null)
-                .and_then(|w| w.decode_utf16());
-            assert_eq!(
-                borrowed.as_deref().ok(),
-                owned.as_deref().ok(),
-                "{in_type:?}: borrowed String disagrees with owned WideString"
-            );
+            let os = std::ffi::OsString::from_property(&data, in_type, TdhOutType::Null);
+            assert_eq!(os.ok().as_deref(), Some("Hi".as_ref()), "{in_type:?}");
+            let s = String::from_property(&data, in_type, TdhOutType::Null);
+            assert_eq!(s.ok().as_deref(), Some("Hi"), "{in_type:?}");
         }
     }
 
@@ -2520,7 +2479,7 @@ mod tests {
     /// declared or truncated length can be odd, and reading such a pair as a null
     /// drops the character before it.
     #[test]
-    fn string_matches_widestring_on_odd_length_wide_input() {
+    fn odd_length_wide_input_keeps_its_last_character() {
         let cases: [(&[u8], &str); 4] = [
             (&[0x41, 0x00, 0x00], "A"),
             (&[0x41, 0x00, 0x42, 0x00, 0x00], "AB"),
@@ -2530,17 +2489,10 @@ mod tests {
         ];
         for in_type in [TdhInType::UnicodeString, TdhInType::NonNullTerminatedString] {
             for (data, expected) in cases {
-                let owned = WideString::from_property(data, in_type, TdhOutType::Null)
-                    .and_then(|w| w.decode_utf16());
+                let os = std::ffi::OsString::from_property(data, in_type, TdhOutType::Null);
                 assert_eq!(
-                    owned.as_deref().ok(),
-                    Some(expected),
-                    "{in_type:?} {data:02X?}"
-                );
-                let borrowed = String::from_property(data, in_type, TdhOutType::Null);
-                assert_eq!(
-                    borrowed.as_deref().ok(),
-                    Some(expected),
+                    os.ok().as_deref(),
+                    Some(expected.as_ref()),
                     "{in_type:?} {data:02X?}"
                 );
             }
@@ -2553,10 +2505,10 @@ mod tests {
 
     /// The malformed cases matter more than the well-formed ones: event payloads
     /// are attacker-influenceable, and the borrowing constructors answer a
-    /// truncated counted prefix with an empty string where the owned ones return
-    /// an error. Decoding `String` through the borrow must keep the error.
+    /// truncated counted prefix with an empty string. Decoding `OsString` through
+    /// the borrow must still report the error.
     #[test]
-    fn string_rejects_malformed_counted_wide_input_like_widestring() {
+    fn os_string_rejects_malformed_counted_wide_input() {
         let cases: [(TdhInType, Vec<u8>); 4] = [
             // Counted prefix truncated away entirely.
             (TdhInType::CountedString, vec![0x41]),
@@ -2570,12 +2522,12 @@ mod tests {
         ];
         for (in_type, data) in cases {
             assert!(
-                String::from_property(&data, in_type, TdhOutType::Null).is_err(),
-                "{in_type:?}: malformed input must not decode to a String"
+                std::ffi::OsString::from_property(&data, in_type, TdhOutType::Null).is_err(),
+                "{in_type:?}: malformed input must not decode to an OsString"
             );
             assert!(
-                WideString::from_property(&data, in_type, TdhOutType::Null).is_err(),
-                "{in_type:?}: owned path must also reject it (invariant both share)"
+                String::from_property(&data, in_type, TdhOutType::Null).is_err(),
+                "{in_type:?}: lossy decoding replaces surrogates, not a malformed prefix"
             );
         }
     }
@@ -2862,8 +2814,9 @@ mod tests {
     fn test_from_property_unicode_string() {
         // "Test" in UTF-16LE with null terminator
         let data = [0x54, 0x00, 0x65, 0x00, 0x73, 0x00, 0x74, 0x00, 0x00, 0x00];
-        let result = String::from_property(&data, TdhInType::UnicodeString, TdhOutType::Null)
-            .expect("parse should succeed");
+        let result =
+            std::ffi::OsString::from_property(&data, TdhInType::UnicodeString, TdhOutType::Null)
+                .expect("parse should succeed");
         assert_eq!(result, "Test");
     }
 
@@ -2889,8 +2842,9 @@ mod tests {
     fn test_from_property_counted_string() {
         // Byte count = 8 (4 chars × 2), "Test" in UTF-16LE
         let data = [0x08, 0x00, 0x54, 0x00, 0x65, 0x00, 0x73, 0x00, 0x74, 0x00];
-        let result = String::from_property(&data, TdhInType::CountedString, TdhOutType::Null)
-            .expect("parse should succeed");
+        let result =
+            std::ffi::OsString::from_property(&data, TdhInType::CountedString, TdhOutType::Null)
+                .expect("parse should succeed");
         assert_eq!(result, "Test");
     }
 
@@ -2913,8 +2867,9 @@ mod tests {
         }
 
         // The value decodes exactly, with no trailing garbage.
-        let decoded = String::from_property(&field, TdhInType::CountedString, TdhOutType::Null)
-            .expect("should decode");
+        let decoded =
+            std::ffi::OsString::from_property(&field, TdhInType::CountedString, TdhOutType::Null)
+                .expect("should decode");
         assert_eq!(decoded, path);
 
         // The length consumes exactly prefix + byte_count and no more — appending
@@ -2960,7 +2915,7 @@ mod tests {
             "length calc",
         );
         assert_rejects_parity(
-            String::from_property(&data, TdhInType::CountedString, TdhOutType::Null),
+            std::ffi::OsString::from_property(&data, TdhInType::CountedString, TdhOutType::Null),
             "owned decoder",
         );
         assert_rejects_parity(
@@ -3082,8 +3037,9 @@ mod tests {
     fn test_truncated_string_from_0_bytes() {
         // Empty data = empty string
         let data: [u8; 0] = [];
-        let result = String::from_property(&data, TdhInType::UnicodeString, TdhOutType::Null)
-            .expect("parse should succeed");
+        let result =
+            std::ffi::OsString::from_property(&data, TdhInType::UnicodeString, TdhOutType::Null)
+                .expect("parse should succeed");
         assert_eq!(result, "");
     }
 
@@ -3091,21 +3047,25 @@ mod tests {
     fn test_string_without_null_terminator() {
         // "Hi" in UTF-16LE without null terminator (ETW truncated it)
         let data = [0x48, 0x00, 0x69, 0x00];
-        let result = String::from_property(&data, TdhInType::UnicodeString, TdhOutType::Null)
-            .expect("parse should succeed");
+        let result =
+            std::ffi::OsString::from_property(&data, TdhInType::UnicodeString, TdhOutType::Null)
+                .expect("parse should succeed");
         assert_eq!(result, "Hi");
     }
 
     #[test]
-    fn test_os_string_from_property_keeps_lone_surrogate() {
+    fn lone_surrogate_survives_os_string_and_is_replaced_in_string() {
         use std::os::windows::ffi::OsStrExt;
         // "H", lone high surrogate, null terminator
         let data = [0x48, 0x00, 0x00, 0xD8, 0x00, 0x00];
-        assert!(String::from_property(&data, TdhInType::UnicodeString, TdhOutType::Null).is_err());
         let result =
             std::ffi::OsString::from_property(&data, TdhInType::UnicodeString, TdhOutType::Null)
                 .expect("parse should succeed");
         assert_eq!(result.encode_wide().collect::<Vec<_>>(), [0x48, 0xD800]);
+
+        let lossy = String::from_property(&data, TdhInType::UnicodeString, TdhOutType::Null)
+            .expect("a lossy String never fails on a surrogate");
+        assert_eq!(lossy, "H\u{FFFD}");
     }
 
     #[test]
@@ -3550,12 +3510,12 @@ mod tests {
     }
 
     // ========================================================================
-    // WideString / AnsiString / String FromProperty — error paths
+    // OsString / AnsiString / String FromProperty — error paths
     // ========================================================================
 
     #[test]
-    fn test_wide_string_manifest_counted_too_short() {
-        let r = crate::types::WideString::from_property(
+    fn test_os_string_manifest_counted_too_short() {
+        let r = std::ffi::OsString::from_property(
             &[0x01u8],
             TdhInType::ManifestCountedString,
             TdhOutType::Null,
@@ -3564,9 +3524,9 @@ mod tests {
     }
 
     #[test]
-    fn test_wide_string_manifest_counted_odd_byte_count() {
+    fn test_os_string_manifest_counted_odd_byte_count() {
         // byte_count = 3 (odd) → not valid for UTF-16
-        let r = crate::types::WideString::from_property(
+        let r = std::ffi::OsString::from_property(
             &[0x03u8, 0x00, 0x48, 0x00, 0x69],
             TdhInType::ManifestCountedString,
             TdhOutType::Null,
@@ -3575,15 +3535,15 @@ mod tests {
     }
 
     #[test]
-    fn test_wide_string_manifest_counted_valid() {
+    fn test_os_string_manifest_counted_valid() {
         // byte_count = 4, "Hi" UTF-16LE
-        let s = crate::types::WideString::from_property(
+        let s = std::ffi::OsString::from_property(
             &[0x04u8, 0x00, 0x48, 0x00, 0x69, 0x00],
             TdhInType::ManifestCountedString,
             TdhOutType::Null,
         )
         .unwrap();
-        assert_eq!(s.to_string_lossy(), "Hi");
+        assert_eq!(s, "Hi");
     }
 
     #[test]
@@ -3969,8 +3929,8 @@ mod position_tests {
         let mut data = reversed_counted_wide_str_bytes("Rev");
         data.extend_from_slice(&0xFACEu32.to_le_bytes());
         let mut parser = EventParser::from_raw_parts(&data, &schema, &mut cache);
-        let val: WideString = parser.get("Target").unwrap();
-        assert_eq!(val.to_string_lossy(), "Rev");
+        let val: std::ffi::OsString = parser.get("Target").unwrap();
+        assert_eq!(val, "Rev");
         let sentinel: u32 = parser.get("Sentinel").unwrap();
         assert_eq!(sentinel, 0xFACE);
     }
@@ -4065,8 +4025,8 @@ mod position_tests {
         let members = parser.struct_members("MyStruct").unwrap();
         assert_eq!(members.len(), 2);
 
-        let name = members[0].to_wide_string().unwrap();
-        assert_eq!(name.decode_utf16().unwrap(), "hello");
+        let name: std::ffi::OsString = members[0].get().unwrap();
+        assert_eq!(name, "hello");
 
         let value: u32 = members[1].get().unwrap();
         assert_eq!(value, 777);
@@ -4121,10 +4081,10 @@ mod position_tests {
         let elements = parser.array_elements("Strings").unwrap();
         assert_eq!(elements.len(), 2);
 
-        let s0 = elements[0].to_wide_string().unwrap();
-        let s1 = elements[1].to_wide_string().unwrap();
-        assert_eq!(s0.decode_utf16().unwrap(), "abc");
-        assert_eq!(s1.decode_utf16().unwrap(), "xy");
+        let s0: std::ffi::OsString = elements[0].get().unwrap();
+        let s1: std::ffi::OsString = elements[1].get().unwrap();
+        assert_eq!(s0, "abc");
+        assert_eq!(s1, "xy");
     }
 
     // =========================================================================

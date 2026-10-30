@@ -450,9 +450,9 @@ fn test_system_logger_file_rundown_and_filename_parsing() {
             // NAME (0): name mapping emitted at trace start for pre-existing files.
             file_io::opcode::FILE_CREATE | file_io::opcode::NAME => {
                 if let Ok(mut p) = ctx.parser(event)
-                    && let Ok(name) = p.get::<String>("FileName")
+                    && let Ok(name) = p.get::<std::ffi::OsString>("FileName")
                 {
-                    let lc = name.to_lowercase();
+                    let lc = name.to_string_lossy().to_lowercase();
                     if probe_lc_cb.iter().any(|probe| lc.ends_with(probe.as_str())) {
                         rt_count_cb.fetch_add(1, Relaxed);
                     }
@@ -463,9 +463,12 @@ fn test_system_logger_file_rundown_and_filename_parsing() {
             file_io::opcode::FILE_RUNDOWN => {
                 rundown_count_cb.fetch_add(1, Relaxed);
                 if let Ok(mut p) = ctx.parser(event)
-                    && let Ok(name) = p.get::<String>("FileName")
+                    && let Ok(name) = p.get::<std::ffi::OsString>("FileName")
                 {
-                    rundown_names_cb.lock().unwrap().push(name.to_lowercase());
+                    rundown_names_cb
+                        .lock()
+                        .unwrap()
+                        .push(name.to_string_lossy().to_lowercase());
                 }
             }
             _ => {}

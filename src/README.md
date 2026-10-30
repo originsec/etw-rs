@@ -57,6 +57,7 @@ Per-property costs are rough averages over the [BENCHMARKS.md](../BENCHMARKS.md)
 
 ### Type System
 - `TdhInType::fixed_size()` is the single source of truth for whether a property is fixed or variable length. Adding a new type requires updating this match, `from_raw()`, and — for a variable-length type — `compute_variable_element_size()` in `parser.rs`.
+- A wide string in-type reads as `OsString` (owned, lossless), `WideStrRef` (borrowed) or `String` (lossy: an unpaired surrogate becomes U+FFFD, so distinct names can collide). `OsString` and `String` share `wide_string_payload` and `null_terminated_len`, so they differ only in that replacement; malformed counted prefixes are an error in both.
 - The per-variant rustdoc on `TdhInType` carries each type's size rule, distilled from `_TDH_IN_TYPE` in the Windows SDK `<tdh.h>`. Read it before touching sizing code; `docs/tdh_type_coverage.md` tracks *implementation* status, not the wire format.
 - `Binary` has no intrinsic size: it must declare a length or a `PropertyParamLength`. One with neither is a parse error in `compute_variable_element_size()`, whatever its `TdhOutType` — `<tdh.h>` implies an `Ipv6` out-type means 16 bytes, but no registered manifest relies on that.
 - MOF (classic) providers use `class_guid` as `ProviderId`, not the provider GUID. The real provider GUID is in `TRACE_EVENT_INFO.ProviderGuid`.

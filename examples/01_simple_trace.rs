@@ -24,7 +24,7 @@ use example_providers::kernel::{
     process,
     process::{event::PROCESS_START, keyword::PROCESS},
 };
-use std::{thread::sleep, time::Duration};
+use std::{ffi::OsString, thread::sleep, time::Duration};
 use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
 
 fn main() -> etw::Result<()> {
@@ -55,12 +55,16 @@ fn main() -> etw::Result<()> {
 
         // We then get fields by type and name
         let pid: u32 = parser.get("ProcessID")?;
-        let image_name: String = parser.get("ImageName")?;
 
         match event.id() {
             PROCESS_START => {
+                // ProcessStart's ImageName is a UTF-16 string, so it is read as an `OsString`.
+                let image_name: OsString = parser.get("ImageName")?;
                 let parent_id: u32 = parser.get("ParentProcessID")?;
-                println!("[+] Process started: {image_name} (PID: {pid}, Parent: {parent_id})");
+                println!(
+                    "[+] Process started: {} (PID: {pid}, Parent: {parent_id})",
+                    image_name.display()
+                );
             }
 
             _ => {

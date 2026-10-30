@@ -30,7 +30,7 @@
 //! ```
 
 use etw::{ALL_KEYWORDS, Guid, Trace};
-use std::{process::Command, thread::sleep, time::Duration};
+use std::{ffi::OsString, process::Command, thread::sleep, time::Duration};
 use windows::Win32::System::Diagnostics::Etw::TRACE_LEVEL_VERBOSE;
 
 /// The kernel `KernelProcess` TraceLogging provider. Note this is *not* the
@@ -72,10 +72,15 @@ fn main() -> etw::Result<()> {
             return Ok(());
         }
 
-        let image: String = parser.get("ImageFileName")?;
+        // Both strings are UTF-16 (counted), so they are read as `OsString`.
+        let image: OsString = parser.get("ImageFileName")?;
         let parent_pid: u32 = parser.get("ParentPid")?;
-        let command_line: String = parser.get("CommandLine")?;
-        println!("[+] {name}: image={image} parent_pid={parent_pid} command_line={command_line:?}");
+        let command_line: OsString = parser.get("CommandLine")?;
+        println!(
+            "[+] {name}: image={} parent_pid={parent_pid} command_line={}",
+            image.display(),
+            command_line.display()
+        );
         Ok(())
     });
 

@@ -1254,17 +1254,19 @@ impl PartialEq<&str> for AnsiStrRef<'_> {
 /// An owned UTF-16 string for ETW Unicode data.
 ///
 /// This is the owned equivalent of [`WideStrRef`], storing UTF-16 code units
-/// in native Windows encoding. Useful when you need to own the string or pass
-/// it to Windows APIs without UTF-16 to UTF-8 conversion.
+/// in native Windows encoding — for passing a string to Windows APIs. An event's
+/// wide-string field is read as an `OsString` (owned) or a [`WideStrRef`]
+/// (borrowed); copy the borrow into a `WideString` when the code units
+/// themselves must outlive the event.
 ///
 /// # Example
 ///
 /// ```no_run
 /// # fn example(parser: &mut etw::EventParser) -> etw::Result<()> {
-/// use etw::types::WideString;
+/// use etw::types::{WideStrRef, WideString};
 ///
-/// // Get as owned UTF-16 (no UTF-8 conversion)
-/// let name: WideString = parser.get("ProcessName")?;
+/// // Copy the UTF-16 code units out of the event (no UTF-8 conversion)
+/// let name = WideString::from(parser.as_ref::<WideStrRef>("ProcessName")?);
 ///
 /// // Convert to UTF-8 only when needed
 /// println!("{}", name.to_string_lossy());

@@ -804,8 +804,9 @@ fn bench_shallow_fields(c: &mut Criterion) {
         let raw_event = unsafe { etw::RawEvent::from_ptr((&raw const record).cast()) };
         let mut parser = parser_cache.parser(raw_event).unwrap();
         let etw_rs_get: Result<String, _> = parser.get(&first_field);
-        let etw_rs_hinted: Result<etw::WideString, _> =
-            parser.get_hinted(&first_field, field_index as u32);
+        let etw_rs_hinted: Result<etw::WideString, _> = parser
+            .as_ref_hinted::<etw::WideStrRef>(&first_field, field_index as u32)
+            .map(etw::WideString::from);
 
         // TdhFormatProperty equivalent (full path)
         let tdh_format_equiv = parse_property_tdh_equivalent(&record, &first_field);
@@ -875,8 +876,9 @@ fn bench_shallow_fields(c: &mut Criterion) {
             let raw_event = unsafe { etw::RawEvent::from_ptr((&raw const record).cast()) };
             let mut parser = parser_cache.parser(raw_event).unwrap();
             b.iter(|| {
-                let result: Result<etw::WideString, _> =
-                    parser.get_hinted(&first_field, field_index as u32);
+                let result: Result<etw::WideString, _> = parser
+                    .as_ref_hinted::<etw::WideStrRef>(&first_field, field_index as u32)
+                    .map(etw::WideString::from);
                 bb(result.ok())
             });
         });
@@ -926,8 +928,9 @@ fn bench_shallow_fields(c: &mut Criterion) {
                 let mut parser_cache = etw::processing_context::ProcessingContext::new();
                 let raw_event = unsafe { etw::RawEvent::from_ptr((&raw const record).cast()) };
                 let mut parser = parser_cache.parser(raw_event).unwrap();
-                let result: Result<etw::WideString, _> =
-                    parser.get_hinted(&first_field, field_index as u32);
+                let result: Result<etw::WideString, _> = parser
+                    .as_ref_hinted::<etw::WideStrRef>(&first_field, field_index as u32)
+                    .map(etw::WideString::from);
                 bb(result.ok())
             });
         });
@@ -1031,8 +1034,9 @@ fn bench_deep_fields(c: &mut Criterion) {
         let raw_event = unsafe { etw::RawEvent::from_ptr((&raw const record).cast()) };
         let mut parser = parser_cache.parser(raw_event).unwrap();
         let etw_rs_get: Result<String, _> = parser.get(&deep_field_name);
-        let etw_rs_hinted: Result<etw::WideString, _> =
-            parser.get_hinted(&deep_field_name, deep_index as u32);
+        let etw_rs_hinted: Result<etw::WideString, _> = parser
+            .as_ref_hinted::<etw::WideStrRef>(&deep_field_name, deep_index as u32)
+            .map(etw::WideString::from);
 
         let tdh_format_equiv = parse_property_tdh_equivalent(&record, &deep_field_name);
         let tdh_get_result = parse_property_with_tdh_get(&record, &deep_field_name);
@@ -1098,8 +1102,9 @@ fn bench_deep_fields(c: &mut Criterion) {
             let raw_event = unsafe { etw::RawEvent::from_ptr((&raw const record).cast()) };
             let mut parser = parser_cache.parser(raw_event).unwrap();
             b.iter(|| {
-                let result: Result<etw::WideString, _> =
-                    parser.get_hinted(&deep_field_name, deep_index as u32);
+                let result: Result<etw::WideString, _> = parser
+                    .as_ref_hinted::<etw::WideStrRef>(&deep_field_name, deep_index as u32)
+                    .map(etw::WideString::from);
                 bb(result.ok())
             });
         });
@@ -1148,8 +1153,9 @@ fn bench_deep_fields(c: &mut Criterion) {
                 let mut parser_cache = etw::processing_context::ProcessingContext::new();
                 let raw_event = unsafe { etw::RawEvent::from_ptr((&raw const record).cast()) };
                 let mut parser = parser_cache.parser(raw_event).unwrap();
-                let result: Result<etw::WideString, _> =
-                    parser.get_hinted(&deep_field_name, deep_index as u32);
+                let result: Result<etw::WideString, _> = parser
+                    .as_ref_hinted::<etw::WideStrRef>(&deep_field_name, deep_index as u32)
+                    .map(etw::WideString::from);
                 bb(result.ok())
             });
         });
@@ -1322,7 +1328,7 @@ fn bench_schema_comparison(c: &mut Criterion) {
 /// Benchmark zero-copy string access vs allocating access.
 ///
 /// This compares:
-/// - `get::<String>()`: Allocates, converts UTF-16→UTF-8
+/// - `get::<OsString>()`: Allocates, converts UTF-16→WTF-8
 /// - `get_wide()`: Zero-copy, returns WideStrRef referencing buffer
 /// - `get_wide().decode_utf16()`: Zero-copy access + deferred conversion
 fn bench_zero_copy_strings(c: &mut Criterion) {
@@ -1395,7 +1401,10 @@ fn bench_zero_copy_strings(c: &mut Criterion) {
         let raw_event = unsafe { etw::RawEvent::from_ptr((&raw const record).cast()) };
         let mut parser = parser_cache.parser(raw_event).unwrap();
 
-        let allocating: String = parser.get(&field_name).unwrap_or_else(|_| String::new());
+        let allocating: String = parser
+            .get::<std::ffi::OsString>(&field_name)
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let zero_copy_str: String = parser
             .as_ref::<etw::WideStrRef>(&field_name)
             .ok()
@@ -1409,7 +1418,7 @@ fn bench_zero_copy_strings(c: &mut Criterion) {
 
         println!("Validation:");
         println!(
-            "  get::<String>():        {:?}",
+            "  get::<OsString>():      {:?}",
             allocating.chars().take(40).collect::<String>()
         );
         println!(
@@ -1425,12 +1434,12 @@ fn bench_zero_copy_strings(c: &mut Criterion) {
     {
         let mut group = c.benchmark_group("string_access");
 
-        // get::<String>() - allocates and converts
-        group.bench_function("get_string_allocating", |b| {
+        // get::<OsString>() - allocates and converts
+        group.bench_function("get_os_string_allocating", |b| {
             let raw_event = unsafe { etw::RawEvent::from_ptr((&raw const record).cast()) };
             let mut parser = parser_cache.parser(raw_event).unwrap();
             b.iter(|| {
-                let result: Result<String, _> = parser.get(&field_name);
+                let result: Result<std::ffi::OsString, _> = parser.get(&field_name);
                 bb(result.ok())
             });
         });
@@ -1512,7 +1521,9 @@ fn bench_zero_copy_strings(c: &mut Criterion) {
             let raw_event = unsafe { etw::RawEvent::from_ptr((&raw const record).cast()) };
             let mut parser = parser_cache.parser(raw_event).unwrap();
             b.iter(|| {
-                let result: Result<String, _> = parser.get(&field_name);
+                let result = parser
+                    .as_ref::<etw::WideStrRef>(&field_name)
+                    .and_then(|ws| ws.decode_utf16());
                 if let Ok(s) = result {
                     bb(s.contains(".local"))
                 } else {
@@ -1809,8 +1820,9 @@ fn bench_property_types(c: &mut Criterion) {
             let raw_event = unsafe { etw::RawEvent::from_ptr((&raw const record).cast()) };
             let mut parser = parser_cache.parser(raw_event).unwrap();
             b.iter(|| {
-                let result: Result<etw::WideString, _> =
-                    parser.get_hinted(string_field, string_index as u32);
+                let result: Result<etw::WideString, _> = parser
+                    .as_ref_hinted::<etw::WideStrRef>(string_field, string_index as u32)
+                    .map(etw::WideString::from);
                 bb(result.ok())
             });
         });
@@ -1926,8 +1938,9 @@ fn bench_index_access(c: &mut Criterion) {
         let mut parser = parser_cache.parser(raw_event).unwrap();
 
         let by_name: Result<String, _> = parser.get(&field_name);
-        let by_hint: Result<etw::WideString, _> =
-            parser.get_hinted(&field_name, field_index as u32);
+        let by_hint: Result<etw::WideString, _> = parser
+            .as_ref_hinted::<etw::WideStrRef>(&field_name, field_index as u32)
+            .map(etw::WideString::from);
 
         println!("Validation (all should match):");
         println!(
@@ -1954,12 +1967,12 @@ fn bench_index_access(c: &mut Criterion) {
     {
         let mut group = c.benchmark_group("index_based_access");
 
-        // get() - convenience API, by name, returns String
+        // get() - convenience API, by name, returns OsString
         group.bench_function("etw_rs_get", |b| {
             let raw_event = unsafe { etw::RawEvent::from_ptr((&raw const record).cast()) };
             let mut parser = parser_cache.parser(raw_event).unwrap();
             b.iter(|| {
-                let result: Result<String, _> = parser.get(&field_name);
+                let result: Result<std::ffi::OsString, _> = parser.get(&field_name);
                 bb(result.ok())
             });
         });
@@ -1969,8 +1982,9 @@ fn bench_index_access(c: &mut Criterion) {
             let raw_event = unsafe { etw::RawEvent::from_ptr((&raw const record).cast()) };
             let mut parser = parser_cache.parser(raw_event).unwrap();
             b.iter(|| {
-                let result: Result<etw::WideString, _> =
-                    parser.get_hinted(&field_name, field_index as u32);
+                let result: Result<etw::WideString, _> = parser
+                    .as_ref_hinted::<etw::WideStrRef>(&field_name, field_index as u32)
+                    .map(etw::WideString::from);
                 bb(result.ok())
             });
         });
@@ -2066,7 +2080,9 @@ fn bench_multi_field_access(c: &mut Criterion) {
         b.iter(|| {
             let mut results = Vec::with_capacity(num_fields);
             for (i, name) in field_names.iter().take(num_fields).enumerate() {
-                let r: Result<etw::WideString, _> = parser.get_hinted(name.as_str(), i as u32);
+                let r: Result<etw::WideString, _> = parser
+                    .as_ref_hinted::<etw::WideStrRef>(name.as_str(), i as u32)
+                    .map(etw::WideString::from);
                 results.push(r.ok());
             }
             bb(results)
@@ -2096,7 +2112,7 @@ fn bench_multi_field_access(c: &mut Criterion) {
             let mut results = Vec::with_capacity(num_fields);
             for prop in parser.properties().unwrap().take(num_fields) {
                 // Allocating: create owned WideString
-                let r = prop.to_wide_string().ok();
+                let r = prop.as_wide_str().ok().map(etw::WideString::from);
                 results.push(r);
             }
             bb(results)
@@ -2126,7 +2142,9 @@ fn bench_multi_field_access(c: &mut Criterion) {
             let mut results = Vec::with_capacity(num_fields);
             // Access in reverse order with hints
             for (i, name) in field_names.iter().take(num_fields).enumerate().rev() {
-                let r: Result<etw::WideString, _> = parser.get_hinted(name.as_str(), i as u32);
+                let r: Result<etw::WideString, _> = parser
+                    .as_ref_hinted::<etw::WideStrRef>(name.as_str(), i as u32)
+                    .map(etw::WideString::from);
                 results.push(r.ok());
             }
             bb(results)

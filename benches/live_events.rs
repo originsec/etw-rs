@@ -66,6 +66,7 @@ mod rpc {
 }
 use etw::{Timestamp, Trace, provider_schema};
 use std::{
+    ffi::OsString,
     sync::{Arc, Mutex, OnceLock},
     time::Duration,
 };
@@ -371,11 +372,11 @@ struct ParsedProcessStart {
     process_token_elevation_type: u32,
     process_token_is_elevated: u32,
     mandatory_label: String,
-    image_name: String,
+    image_name: OsString,
     image_checksum: u32,
     time_date_stamp: u32,
-    package_full_name: String,
-    package_relative_app_id: String,
+    package_full_name: OsString,
+    package_relative_app_id: OsString,
     security_mitigations: u32,
 }
 
@@ -390,7 +391,7 @@ struct ParsedFileCreate {
     create_options: u32,
     create_attributes: u32,
     share_access: u32,
-    file_name: String,
+    file_name: OsString,
 }
 
 /// Parsed Thread Start data (shared by all parsers including ferrisetw)
@@ -444,8 +445,8 @@ struct ParsedRegistryCreateKey {
     key_object: usize,
     status: u32,
     disposition: u32,
-    base_name: String,
-    relative_name: String,
+    base_name: OsString,
+    relative_name: OsString,
 }
 
 /// Parsed RPC Client Call data (shared by all parsers including ferrisetw)
@@ -456,9 +457,9 @@ struct ParsedRpcClientCall {
     interface_uuid: u128,
     proc_num: u32,
     protocol: u32,
-    network_address: String,
-    endpoint: String,
-    options: String,
+    network_address: OsString,
+    endpoint: OsString,
+    options: OsString,
     authentication_level: u32,
     authentication_service: u32,
     impersonation_level: u32,
@@ -825,13 +826,17 @@ fn bench_process_start_ferrisetw() {
                         .unwrap(),
                     process_token_is_elevated: parser.try_parse("ProcessTokenIsElevated").unwrap(),
                     mandatory_label: parser.try_parse::<String>("MandatoryLabel").unwrap(),
-                    image_name: parser.try_parse::<String>("ImageName").unwrap(),
+                    image_name: parser.try_parse::<String>("ImageName").unwrap().into(),
                     image_checksum: parser.try_parse("ImageChecksum").unwrap(),
                     time_date_stamp: parser.try_parse("TimeDateStamp").unwrap(),
-                    package_full_name: parser.try_parse::<String>("PackageFullName").unwrap(),
+                    package_full_name: parser
+                        .try_parse::<String>("PackageFullName")
+                        .unwrap()
+                        .into(),
                     package_relative_app_id: parser
                         .try_parse::<String>("PackageRelativeAppId")
-                        .unwrap(),
+                        .unwrap()
+                        .into(),
                     security_mitigations: parser.try_parse("SecurityMitigations").unwrap(),
                 };
 
@@ -928,19 +933,11 @@ fn bench_process_start_static() {
                 process_token_elevation_type: parser.ProcessTokenElevationType().unwrap(),
                 process_token_is_elevated: parser.ProcessTokenIsElevated().unwrap(),
                 mandatory_label: format!("{}", parser.MandatoryLabel().unwrap()),
-                image_name: parser.ImageName_ref().unwrap().decode_utf16().unwrap(),
+                image_name: parser.ImageName().unwrap(),
                 image_checksum: parser.ImageChecksum().unwrap(),
                 time_date_stamp: parser.TimeDateStamp().unwrap(),
-                package_full_name: parser
-                    .PackageFullName_ref()
-                    .unwrap()
-                    .decode_utf16()
-                    .unwrap(),
-                package_relative_app_id: parser
-                    .PackageRelativeAppId_ref()
-                    .unwrap()
-                    .decode_utf16()
-                    .unwrap(),
+                package_full_name: parser.PackageFullName().unwrap(),
+                package_relative_app_id: parser.PackageRelativeAppId().unwrap(),
                 security_mitigations: parser.SecurityMitigations().unwrap(),
             };
 
@@ -1026,7 +1023,7 @@ fn bench_file_create_ferrisetw() {
                     create_options: parser.try_parse("CreateOptions").unwrap(),
                     create_attributes: parser.try_parse("CreateAttributes").unwrap(),
                     share_access: parser.try_parse("ShareAccess").unwrap(),
-                    file_name: parser.try_parse::<String>("FileName").unwrap(),
+                    file_name: parser.try_parse::<String>("FileName").unwrap().into(),
                 };
 
                 black_box(&parsed);
@@ -1104,7 +1101,7 @@ fn bench_file_create_static() {
                 create_options: parser.CreateOptions().unwrap(),
                 create_attributes: parser.CreateAttributes().unwrap(),
                 share_access: parser.ShareAccess().unwrap(),
-                file_name: parser.FileName_ref().unwrap().decode_utf16().unwrap(),
+                file_name: parser.FileName().unwrap(),
             };
 
             black_box(&parsed);
@@ -1420,8 +1417,8 @@ fn bench_registry_create_key_ferrisetw() {
                     key_object: parser.try_parse::<u64>("KeyObject").unwrap() as usize,
                     status: parser.try_parse("Status").unwrap(),
                     disposition: parser.try_parse("Disposition").unwrap(),
-                    base_name: parser.try_parse::<String>("BaseName").unwrap(),
-                    relative_name: parser.try_parse::<String>("RelativeName").unwrap(),
+                    base_name: parser.try_parse::<String>("BaseName").unwrap().into(),
+                    relative_name: parser.try_parse::<String>("RelativeName").unwrap().into(),
                 };
 
                 black_box(&parsed);
@@ -1496,8 +1493,8 @@ fn bench_registry_create_key_static() {
                 key_object: parser.KeyObject().unwrap(),
                 status: parser.Status().unwrap(),
                 disposition: parser.Disposition().unwrap(),
-                base_name: parser.BaseName_ref().unwrap().decode_utf16().unwrap(),
-                relative_name: parser.RelativeName_ref().unwrap().decode_utf16().unwrap(),
+                base_name: parser.BaseName().unwrap(),
+                relative_name: parser.RelativeName().unwrap(),
             };
 
             black_box(&parsed);
@@ -1591,9 +1588,9 @@ fn bench_rpc_client_call_ferrisetw() {
                     ),
                     proc_num: parser.try_parse("ProcNum").unwrap(),
                     protocol: parser.try_parse("Protocol").unwrap(),
-                    network_address: parser.try_parse::<String>("NetworkAddress").unwrap(),
-                    endpoint: parser.try_parse::<String>("Endpoint").unwrap(),
-                    options: parser.try_parse::<String>("Options").unwrap(),
+                    network_address: parser.try_parse::<String>("NetworkAddress").unwrap().into(),
+                    endpoint: parser.try_parse::<String>("Endpoint").unwrap().into(),
+                    options: parser.try_parse::<String>("Options").unwrap().into(),
                     authentication_level: parser.try_parse("AuthenticationLevel").unwrap(),
                     authentication_service: parser.try_parse("AuthenticationService").unwrap(),
                     impersonation_level: parser.try_parse("ImpersonationLevel").unwrap(),
@@ -1673,9 +1670,9 @@ fn bench_rpc_client_call_static() {
                 interface_uuid: guid_to_u128(parser.InterfaceUuid().unwrap()),
                 proc_num: parser.ProcNum().unwrap(),
                 protocol: parser.Protocol().unwrap(),
-                network_address: parser.NetworkAddress_ref().unwrap().decode_utf16().unwrap(),
-                endpoint: parser.Endpoint_ref().unwrap().decode_utf16().unwrap(),
-                options: parser.Options_ref().unwrap().decode_utf16().unwrap(),
+                network_address: parser.NetworkAddress().unwrap(),
+                endpoint: parser.Endpoint().unwrap(),
+                options: parser.Options().unwrap(),
                 authentication_level: parser.AuthenticationLevel().unwrap(),
                 authentication_service: parser.AuthenticationService().unwrap(),
                 impersonation_level: parser.ImpersonationLevel().unwrap(),
@@ -1710,15 +1707,11 @@ fn preflight_process(events: &[CapturedEvent]) {
     let s_elevation: u32 = sp.ProcessTokenElevationType().unwrap();
     let s_elevated: u32 = sp.ProcessTokenIsElevated().unwrap();
     let s_sid = format!("{}", sp.MandatoryLabel().unwrap());
-    let s_image = sp.ImageName_ref().unwrap().decode_utf16().unwrap();
+    let s_image = sp.ImageName().unwrap();
     let s_checksum: u32 = sp.ImageChecksum().unwrap();
     let s_tds: u32 = sp.TimeDateStamp().unwrap();
-    let s_pkg_full = sp.PackageFullName_ref().unwrap().decode_utf16().unwrap();
-    let s_pkg_rel_app = sp
-        .PackageRelativeAppId_ref()
-        .unwrap()
-        .decode_utf16()
-        .unwrap();
+    let s_pkg_full = sp.PackageFullName().unwrap();
+    let s_pkg_rel_app = sp.PackageRelativeAppId().unwrap();
     let s_mitigations: u32 = sp.SecurityMitigations().unwrap();
 
     // etw-rs get parser
@@ -1741,11 +1734,11 @@ fn preflight_process(events: &[CapturedEvent]) {
         .get::<Sid>("MandatoryLabel")
         .map(|s| s.to_string())
         .unwrap();
-    let g_image: String = gp.get("ImageName").unwrap();
+    let g_image: OsString = gp.get("ImageName").unwrap();
     let g_checksum: u32 = gp.get("ImageChecksum").unwrap();
     let g_tds: u32 = gp.get("TimeDateStamp").unwrap();
-    let g_pkg_full: String = gp.get("PackageFullName").unwrap();
-    let g_pkg_rel_app: String = gp.get("PackageRelativeAppId").unwrap();
+    let g_pkg_full: OsString = gp.get("PackageFullName").unwrap();
+    let g_pkg_rel_app: OsString = gp.get("PackageRelativeAppId").unwrap();
     let g_mitigations: u32 = gp.get("SecurityMitigations").unwrap();
 
     // ferrisetw parser
@@ -1765,11 +1758,14 @@ fn preflight_process(events: &[CapturedEvent]) {
     let f_elevation: u32 = fp.try_parse("ProcessTokenElevationType").unwrap();
     let f_elevated: u32 = fp.try_parse("ProcessTokenIsElevated").unwrap();
     let f_sid: String = fp.try_parse::<String>("MandatoryLabel").unwrap();
-    let f_image: String = fp.try_parse::<String>("ImageName").unwrap();
+    let f_image: OsString = fp.try_parse::<String>("ImageName").unwrap().into();
     let f_checksum: u32 = fp.try_parse("ImageChecksum").unwrap();
     let f_tds: u32 = fp.try_parse("TimeDateStamp").unwrap();
-    let f_pkg_full: String = fp.try_parse::<String>("PackageFullName").unwrap();
-    let f_pkg_rel_app: String = fp.try_parse::<String>("PackageRelativeAppId").unwrap();
+    let f_pkg_full: OsString = fp.try_parse::<String>("PackageFullName").unwrap().into();
+    let f_pkg_rel_app: OsString = fp
+        .try_parse::<String>("PackageRelativeAppId")
+        .unwrap()
+        .into();
     let f_mitigations: u32 = fp.try_parse("SecurityMitigations").unwrap();
 
     // Assert static == get
@@ -1983,7 +1979,7 @@ fn preflight_file(events: &[CapturedEvent]) {
     let s_create_options: u32 = sp.CreateOptions().unwrap();
     let s_create_attributes: u32 = sp.CreateAttributes().unwrap();
     let s_share_access: u32 = sp.ShareAccess().unwrap();
-    let s_file_name = sp.FileName_ref().unwrap().decode_utf16().unwrap();
+    let s_file_name = sp.FileName().unwrap();
 
     // etw-rs get parser
     let record = event.as_event_record();
@@ -1998,7 +1994,7 @@ fn preflight_file(events: &[CapturedEvent]) {
     let g_create_options: u32 = gp.get("CreateOptions").unwrap();
     let g_create_attributes: u32 = gp.get("CreateAttributes").unwrap();
     let g_share_access: u32 = gp.get("ShareAccess").unwrap();
-    let g_file_name: String = gp.get("FileName").unwrap();
+    let g_file_name: OsString = gp.get("FileName").unwrap();
 
     // ferrisetw parser
     let schema_locator = ferrisetw::schema_locator::SchemaLocator::default();
@@ -2013,7 +2009,7 @@ fn preflight_file(events: &[CapturedEvent]) {
     let f_create_options: u32 = fp.try_parse("CreateOptions").unwrap();
     let f_create_attributes: u32 = fp.try_parse("CreateAttributes").unwrap();
     let f_share_access: u32 = fp.try_parse("ShareAccess").unwrap();
-    let f_file_name: String = fp.try_parse::<String>("FileName").unwrap();
+    let f_file_name: OsString = fp.try_parse::<String>("FileName").unwrap().into();
 
     assert_eq!(s_irp, g_irp, "irp: static != get");
     assert_eq!(s_file_object, g_file_object, "file_object: static != get");
@@ -2067,8 +2063,8 @@ fn preflight_registry(events: &[CapturedEvent]) {
     let s_key_object: usize = sp.KeyObject().unwrap();
     let s_status: u32 = sp.Status().unwrap();
     let s_disposition: u32 = sp.Disposition().unwrap();
-    let s_base_name = sp.BaseName_ref().unwrap().decode_utf16().unwrap();
-    let s_relative_name = sp.RelativeName_ref().unwrap().decode_utf16().unwrap();
+    let s_base_name = sp.BaseName().unwrap();
+    let s_relative_name = sp.RelativeName().unwrap();
 
     // etw-rs get parser
     let record = event.as_event_record();
@@ -2081,8 +2077,8 @@ fn preflight_registry(events: &[CapturedEvent]) {
     let g_key_object: usize = gp.get("KeyObject").unwrap();
     let g_status: u32 = gp.get("Status").unwrap();
     let g_disposition: u32 = gp.get("Disposition").unwrap();
-    let g_base_name: String = gp.get("BaseName").unwrap();
-    let g_relative_name: String = gp.get("RelativeName").unwrap();
+    let g_base_name: OsString = gp.get("BaseName").unwrap();
+    let g_relative_name: OsString = gp.get("RelativeName").unwrap();
 
     // ferrisetw parser
     let schema_locator = ferrisetw::schema_locator::SchemaLocator::default();
@@ -2095,8 +2091,8 @@ fn preflight_registry(events: &[CapturedEvent]) {
     let f_key_object = fp.try_parse::<u64>("KeyObject").unwrap() as usize;
     let f_status: u32 = fp.try_parse("Status").unwrap();
     let f_disposition: u32 = fp.try_parse("Disposition").unwrap();
-    let f_base_name: String = fp.try_parse::<String>("BaseName").unwrap();
-    let f_relative_name: String = fp.try_parse::<String>("RelativeName").unwrap();
+    let f_base_name: OsString = fp.try_parse::<String>("BaseName").unwrap().into();
+    let f_relative_name: OsString = fp.try_parse::<String>("RelativeName").unwrap().into();
 
     assert_eq!(s_base_object, g_base_object, "base_object: static != get");
     assert_eq!(s_key_object, g_key_object, "key_object: static != get");
@@ -2141,9 +2137,9 @@ fn preflight_rpc(events: &[CapturedEvent]) {
     let s_uuid = guid_to_u128(sp.InterfaceUuid().unwrap());
     let s_proc_num: u32 = sp.ProcNum().unwrap();
     let s_protocol: u32 = sp.Protocol().unwrap();
-    let s_network_address = sp.NetworkAddress_ref().unwrap().decode_utf16().unwrap();
-    let s_endpoint = sp.Endpoint_ref().unwrap().decode_utf16().unwrap();
-    let s_options = sp.Options_ref().unwrap().decode_utf16().unwrap();
+    let s_network_address = sp.NetworkAddress().unwrap();
+    let s_endpoint = sp.Endpoint().unwrap();
+    let s_options = sp.Options().unwrap();
     let s_auth_level: u32 = sp.AuthenticationLevel().unwrap();
     let s_auth_service: u32 = sp.AuthenticationService().unwrap();
     let s_impersonation: u32 = sp.ImpersonationLevel().unwrap();
@@ -2158,9 +2154,9 @@ fn preflight_rpc(events: &[CapturedEvent]) {
     let g_uuid = guid_to_u128(gp.get("InterfaceUuid").unwrap());
     let g_proc_num: u32 = gp.get("ProcNum").unwrap();
     let g_protocol: u32 = gp.get("Protocol").unwrap();
-    let g_network_address: String = gp.get("NetworkAddress").unwrap();
-    let g_endpoint: String = gp.get("Endpoint").unwrap();
-    let g_options: String = gp.get("Options").unwrap();
+    let g_network_address: OsString = gp.get("NetworkAddress").unwrap();
+    let g_endpoint: OsString = gp.get("Endpoint").unwrap();
+    let g_options: OsString = gp.get("Options").unwrap();
     let g_auth_level: u32 = gp.get("AuthenticationLevel").unwrap();
     let g_auth_service: u32 = gp.get("AuthenticationService").unwrap();
     let g_impersonation: u32 = gp.get("ImpersonationLevel").unwrap();
@@ -2180,9 +2176,9 @@ fn preflight_rpc(events: &[CapturedEvent]) {
     );
     let f_proc_num: u32 = fp.try_parse("ProcNum").unwrap();
     let f_protocol: u32 = fp.try_parse("Protocol").unwrap();
-    let f_network_address: String = fp.try_parse::<String>("NetworkAddress").unwrap();
-    let f_endpoint: String = fp.try_parse::<String>("Endpoint").unwrap();
-    let f_options: String = fp.try_parse::<String>("Options").unwrap();
+    let f_network_address: OsString = fp.try_parse::<String>("NetworkAddress").unwrap().into();
+    let f_endpoint: OsString = fp.try_parse::<String>("Endpoint").unwrap().into();
+    let f_options: OsString = fp.try_parse::<String>("Options").unwrap().into();
     let f_auth_level: u32 = fp.try_parse("AuthenticationLevel").unwrap();
     let f_auth_service: u32 = fp.try_parse("AuthenticationService").unwrap();
     let f_impersonation: u32 = fp.try_parse("ImpersonationLevel").unwrap();
@@ -3101,16 +3097,15 @@ struct ParserColumn {
 ///
 /// `etw-rs (get)` and `etw-rs (get_hinted)` must differ *only* in how they resolve
 /// a property name, so both build their string fields the same way, with
-/// `get`/`get_hinted::<String>`. They previously did not: the hinted arms borrowed
+/// `get`/`get_hinted::<OsString>`. They previously did not: the hinted arms borrowed
 /// a `WideStrRef` and called `to_string_lossy`, which is a different API *and*
 /// different semantics (lossy rather than strict), so the ratio between the two
 /// columns conflated name resolution with string decoding and could not be read
 /// as a hinting comparison at all on any event carrying a string.
 ///
-/// Measured in isolation, that string difference is worth under 10ns per field
-/// (`String::from_property` 84ns against `WideStrRef` + `to_string_lossy` 82ns on
-/// a 58-character path), so it was never the bulk of the gap — but it made the
-/// comparison unsound, which is worse than making it wrong by a known amount.
+/// Measured in isolation, that string difference was worth under 10ns per field,
+/// so it was never the bulk of the gap — but it made the comparison unsound,
+/// which is worse than making it wrong by a known amount.
 const PARSER_COLUMNS: &[ParserColumn] = &[
     ParserColumn {
         id: "etw-rs-static",

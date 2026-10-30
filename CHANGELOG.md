@@ -33,6 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unpaired surrogates in file names, registry keys and similar identifiers; the `String`
   accessor rejected such events. Use the `_ref()` accessor with `decode_utf16()` or
   `to_string_lossy()` for a `String`.
+- **Breaking:** `get::<String>()` on a wide-string property (`UnicodeString`,
+  `NonNullTerminatedString` and the counted string in-types) decodes lossily: an unpaired
+  surrogate becomes U+FFFD rather than failing the read. Distinct names can therefore
+  collide; read an `OsString` (owned, lossless) or borrow a `WideStrRef` when the exact
+  value matters. `FromProperty for WideString` and `Property::to_wide_string()` are
+  removed — copy a `WideStrRef` into a `WideString` when the UTF-16 code units must
+  outlive the event.
+- `get::<OsString>()` decodes straight from the event buffer instead of copying into a
+  `WideString` first, one allocation fewer per call.
 - `AnsiStrRef::decode(CP_UTF8)` decodes without a round trip through Win32 and UTF-16,
   2–3.7× faster. Results and errors are unchanged.
 

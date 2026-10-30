@@ -114,7 +114,7 @@ fn test_field_type_coverage() {
         for (type_name, prop_name, in_type) in props {
             let value_str = match in_type {
                 TdhInType::UnicodeString => parser
-                    .get::<String>(prop_name.as_str())
+                    .get::<std::ffi::OsString>(prop_name.as_str())
                     .map_or_else(|e| format!("ERR: {e}"), |v| format!("{v:?}")),
                 TdhInType::AnsiString => parser.get::<AnsiString>(prop_name.as_str()).map_or_else(
                     |e| format!("ERR: {e}"),

@@ -20,7 +20,7 @@
 
 use etw::{Sid, Trace, system_logger::masks::PERF_NO_SYSCONFIG};
 use example_providers::{classic::process as system_process, kernel::process as kernel_process};
-use std::{thread::sleep, time::Duration};
+use std::{ffi::OsString, thread::sleep, time::Duration};
 
 fn main() -> etw::Result<()> {
     println!("System Logger + Manifest Provider Example");
@@ -44,8 +44,11 @@ fn main() -> etw::Result<()> {
             let pid: u32 = parser.get("ProcessId")?;
             // Only the classic event includes the command line and user SID
             let sid: Sid = parser.get("UserSID")?;
-            let cmdline: String = parser.get("CommandLine")?;
-            println!("[+] SystemLogger   pid:{pid} sid:{sid} {cmdline}");
+            let cmdline: OsString = parser.get("CommandLine")?;
+            println!(
+                "[+] SystemLogger   pid:{pid} sid:{sid} {}",
+                cmdline.display()
+            );
         }
 
         if event.provider_guid() == kernel_process::GUID
@@ -53,13 +56,14 @@ fn main() -> etw::Result<()> {
         {
             let mut parser = context.parser(event)?;
             let pid: u32 = parser.get("ProcessID")?;
-            let image_name: String = parser.get("ImageName")?;
+            let image_name: OsString = parser.get("ImageName")?;
             // Only the modern event includes the sequence number and integrity
             // Note: EVENT_HEADER_EXT_TYPE_SID logs the creator thread's SID
             let sequence: u64 = parser.get("ProcessSequenceNumber")?;
             let integrity: Sid = parser.get("MandatoryLabel")?;
             println!(
-                "[+] Kernel-Process pid:{pid} sequence:{sequence} integrity:{integrity} {image_name}"
+                "[+] Kernel-Process pid:{pid} sequence:{sequence} integrity:{integrity} {}",
+                image_name.display()
             );
         }
 

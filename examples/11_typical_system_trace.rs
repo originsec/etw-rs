@@ -22,7 +22,7 @@
 
 use etw::{Trace, stack_walk::StackWalkData, system_logger::masks::PERF_NO_SYSCONFIG};
 use example_providers::classic::{image, process, stack_walk};
-use std::{thread::sleep, time::Duration};
+use std::{ffi::OsString, thread::sleep, time::Duration};
 
 fn main() -> etw::Result<()> {
     println!("System Trace Example - Kernel Events with Stack Tracing");
@@ -100,16 +100,23 @@ fn main() -> etw::Result<()> {
 
             image::CLASS_GUID if event.opcode() == image::opcode::LOAD => {
                 let mut parser = context.parser(event)?;
-                let file_name: String = parser.get("FileName")?;
+                let file_name: OsString = parser.get("FileName")?;
                 // Verbosity: only print ntdll loads for this demo as we just want to show event
                 // timing.
-                if !file_name.to_lowercase().ends_with("\\ntdll.dll") {
+                if !file_name
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .ends_with("\\ntdll.dll")
+                {
                     return Ok(());
                 }
 
                 let pid = event.process_id();
                 let timestamp = event.timestamp();
-                println!("[*] {timestamp} pid:{pid} Image loaded: {file_name}\n");
+                println!(
+                    "[*] {timestamp} pid:{pid} Image loaded: {}\n",
+                    file_name.display()
+                );
             }
 
             // Ignore other events - especially EVENT_TRACE_GUID header events

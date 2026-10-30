@@ -66,11 +66,11 @@ may also carry `@ out(...)` — see [TdhOutType Decoding](#tdhouttype-decoding).
 
 | TdhInType | Value | Size | Dynamic `FromProperty` | Dynamic `FromPropertyRef` | Static Schema Type | Display | Position Tests |
 |-----------|-------|------|------------------------|---------------------------|---------------------|---------|----------------|
-| `UnicodeString` | 1 | Null-terminated UTF-16 | `WideString`, `OsString`, `String` | `WideStrRef` | `WideStrRef` | Yes | D+S |
+| `UnicodeString` | 1 | Null-terminated UTF-16 | `OsString`, `String` (lossy) | `WideStrRef` | `WideStrRef` | Yes | D+S |
 | `AnsiString` | 2 | Null-terminated ANSI | `AnsiString`, `String` | `AnsiStrRef` | `AnsiStrRef` | Yes | D+S |
 | `Sid` | 19 | 8 + sub_auth×4 | `Sid` | `SidRef` | `SidRef` | Yes | D+S |
 | `WbemSid` | 310 | TOKEN_USER(16 on 64-bit, 8 on 32-bit) + SID | `Sid` | `SidRef` | `WbemSidRef` | Yes | D |
-| `NonNullTerminatedString` | 304 | Declared length or `PropertyParamLength` only | `WideString`, `OsString`, `String` | `WideStrRef` | — | Yes | — |
+| `NonNullTerminatedString` | 304 | Declared length or `PropertyParamLength` only | `OsString`, `String` (lossy) | `WideStrRef` | — | Yes | — |
 | `NonNullTerminatedAnsiString` | 305 | Declared length or `PropertyParamLength` only | `AnsiString`, `String` | `AnsiStrRef` | — | Yes | — |
 | `Binary` | 14 | Declared length or `PropertyParamLength`; neither is a parse error | `Vec<u8>`, `SocketAddr`, `Ipv4Addr`, `Ipv6Addr` | `&[u8]` | `u8 @ length(..)` / `fixed_length(..)` / `count_bytes(..)` → `&[u8]` | Hex bytes | D |
 
@@ -86,12 +86,12 @@ no declared length they fail with "Cannot determine size".
 
 | TdhInType | Value | Size | Dynamic `FromProperty` | Dynamic `FromPropertyRef` | Static Schema Type | Display | Position Tests |
 |-----------|-------|------|------------------------|---------------------------|---------------------|---------|----------------|
-| `ManifestCountedString` | 22 | 2 + byte_count | `WideString`, `OsString`, `String` | `WideStrRef` | `CountedWideStrRef` | Yes | S |
+| `ManifestCountedString` | 22 | 2 + byte_count | `OsString`, `String` (lossy) | `WideStrRef` | `CountedWideStrRef` | Yes | S |
 | `ManifestCountedAnsiString` | 23 | 2 + byte_count | `AnsiString`, `String` | `AnsiStrRef` | `CountedAnsiStrRef` | Yes | S |
 | `ManifestCountedBinary` | 25 | 2 + byte_count | — | `&[u8]` | `CountedBinaryRef` | Hex bytes (prefix included) | S |
-| `CountedString` | 300 | 2 + byte_count | `WideString`, `OsString`, `String` | `WideStrRef` | — | Yes | D |
+| `CountedString` | 300 | 2 + byte_count | `OsString`, `String` (lossy) | `WideStrRef` | — | Yes | D |
 | `CountedAnsiString` | 301 | 2 + byte_count | `AnsiString`, `String` | `AnsiStrRef` | — | Yes | D |
-| `ReversedCountedString` | 302 | 2 + byte_count (BE prefix) | `WideString`, `OsString`, `String` | `WideStrRef` | — | Yes | D |
+| `ReversedCountedString` | 302 | 2 + byte_count (BE prefix) | `OsString`, `String` (lossy) | `WideStrRef` | — | Yes | D |
 | `ReversedCountedAnsiString` | 303 | 2 + byte_count (BE prefix) | `AnsiString`, `String` | `AnsiStrRef` | — | Yes | D |
 
 Every prefix in this table counts **bytes**, not characters — including the UTF-16 ones. The

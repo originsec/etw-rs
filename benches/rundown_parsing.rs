@@ -346,8 +346,10 @@ fn bench_tdh_parser(c: &mut Criterion) {
                     // Use get_hinted with property index hints for better performance
                     // FileObject is index 0, FileName is index 1
                     let file_object: u64 = parser.get_hinted("FileObject", 0).unwrap_or(0);
-                    let file_name: WideString =
-                        parser.get_hinted("FileName", 1).unwrap_or_default();
+                    let file_name = parser
+                        .as_ref_hinted::<etw::WideStrRef>("FileName", 1)
+                        .map(WideString::from)
+                        .unwrap_or_default();
 
                     let parsed = ParsedFileRundownEtwRs {
                         timestamp: record.EventHeader.TimeStamp,

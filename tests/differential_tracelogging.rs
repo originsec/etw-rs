@@ -198,7 +198,14 @@ fn tracelogging_fields_agree_with_tdh_and_intent() {
         entry.lead = parser.get::<u8>("Lead").ok();
         entry.sentinel = parser.get::<u32>("Sentinel").ok();
         for (field, _) in expected_text(&entry.name) {
-            match parser.get::<String>(field) {
+            // Wide fields decode to `OsString`, ANSI ones to `String`.
+            let decoded = match parser.get::<std::ffi::OsString>(field) {
+                Ok(v) => Ok(v.to_string_lossy().into_owned()),
+                Err(wide) => parser
+                    .get::<String>(field)
+                    .map_err(|ansi| format!("as wide: {wide}; as ANSI: {ansi}")),
+            };
+            match decoded {
                 Ok(v) => entry.text_fields.push((field.to_owned(), v)),
                 Err(e) => entry.problems.push(format!(
                     "{}.{field}: etw-rs failed to decode: {e}",

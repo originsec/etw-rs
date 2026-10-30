@@ -69,7 +69,10 @@ fn test_kernel_file_parses_pointer_and_widestr_fields() {
         }
         let mut p = context.parser(event)?;
         let file_key: usize = p.get("FileKey")?;
-        let file_name: String = p.get("FileName")?;
+        let file_name = p
+            .get::<std::ffi::OsString>("FileName")?
+            .to_string_lossy()
+            .into_owned();
         if file_name.to_lowercase().ends_with(&unique_name_lc_cb) {
             captures_cb.lock().unwrap().push(NameCreateData {
                 file_key,

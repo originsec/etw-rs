@@ -15,7 +15,7 @@
 //! cargo run --example 04_extended_data
 //! ```
 
-use etw::{EnableProperty, Trace, WideStrRef, WideString};
+use etw::{EnableProperty, Trace, WideStrRef};
 use example_providers::{kernel, kernel::process::event::PROCESS_START};
 use std::{
     ffi::OsString, os::windows::ffi::OsStringExt, process::Command, thread::sleep, time::Duration,
@@ -66,7 +66,7 @@ fn main() -> etw::Result<()> {
 
         // Properties (UserData) have parameterised parsers
         let mut parser = context.parser(event)?;
-        let image_name: WideString = parser.get("ImageName")?;
+        let image_name: OsString = parser.get("ImageName")?;
 
         // We can also just grab a reference for faster filtering prior to copying data from the
         // event
@@ -78,7 +78,7 @@ fn main() -> etw::Result<()> {
         let stack = event.stack_trace()?;
 
         let stack_summary = resolve_modules(&stack.addresses());
-        println!("Process: {image_name}");
+        println!("Process: {}", image_name.display());
         println!("  PSK: 0x{psk:016X} (PID:{process_id})");
         println!("  SID: {sid}");
         println!("  Stack walk -");

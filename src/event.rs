@@ -867,7 +867,7 @@ impl std::fmt::Debug for RawEvent {
 ///
 /// Returns a `Vec` of `(name, value)` pairs in schema-defined order.
 fn format_properties(parser: &mut crate::parser::EventParser<'_>) -> Vec<(String, String)> {
-    use crate::types::{AnsiString, TdhInType};
+    use crate::types::{AnsiString, TdhInType, WideStrRef};
 
     // Collect property info first to avoid borrowing schema while mutating parser
     let props: Vec<_> = parser
@@ -894,8 +894,8 @@ fn format_properties(parser: &mut crate::parser::EventParser<'_>) -> Vec<(String
             | TdhInType::CountedString
             | TdhInType::ReversedCountedString
             | TdhInType::ManifestCountedString => parser
-                .get::<String>(&name)
-                .unwrap_or_else(|_| "<parse error>".to_owned()),
+                .as_ref::<WideStrRef>(&name)
+                .map_or_else(|_| "<parse error>".to_owned(), |s| s.to_string_lossy()),
             TdhInType::AnsiString
             | TdhInType::NonNullTerminatedAnsiString
             | TdhInType::CountedAnsiString

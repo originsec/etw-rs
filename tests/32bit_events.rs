@@ -111,7 +111,8 @@ fn test_parse_32bit_dns_events() {
             Ok(mut parser) => {
                 // Event 3008 has QueryName (UnicodeString) and QueryStatus (UInt32)
                 if event.id() == dns_client::event::EVENT_3008 {
-                    let name: String = parser.get("QueryName")?;
+                    let name = parser.get::<std::ffi::OsString>("QueryName")?;
+                    let name = name.display();
                     let status: u32 = parser.get("QueryStatus")?;
                     if printed_once_clone
                         .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)

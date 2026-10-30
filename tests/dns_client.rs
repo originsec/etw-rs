@@ -80,7 +80,8 @@ fn test_user_dns_client_events() {
 
         let mut parser = context.parser(event)?;
 
-        let query: String = parser.get("QueryName")?;
+        let query = parser.get::<std::ffi::OsString>("QueryName")?;
+        let query = query.display();
         let query_type: u32 = parser.get("QueryType")?;
         println!(
             "Captured DNS event:\n  Event ID: {}\n  QueryName: {query}\n  QueryType: {} ({})",

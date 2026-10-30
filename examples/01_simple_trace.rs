@@ -19,7 +19,7 @@
 //! cargo run --example 01_simple_trace
 //! ```
 
-use etw::{Error::Win32Error, Trace};
+use etw::{Error::Win32Error, Trace, WideStrRef};
 use example_providers::kernel::{
     process,
     process::{event::PROCESS_START, keyword::PROCESS},
@@ -53,18 +53,22 @@ fn main() -> etw::Result<()> {
         // Using the TDH schema allows safe parsing of events using the registered schema
         let mut parser = context.parser(event)?;
 
-        // We then get fields by type and name
-        let pid: u32 = parser.get("ProcessID")?;
-
         match event.id() {
             PROCESS_START => {
-                // ProcessStart's ImageName is a UTF-16 string, so it is read as an `OsString`.
-                let image_name: OsString = parser.get("ImageName")?;
+                // We then get fields by type and name
+                let pid: u32 = parser.get("ProcessID")?;
+
+                // Note: ETW's UnicodeString contains a Windows wide string - which isn't always
+                // valid UTF-16. It can be accessed in three ways.
+                // Owned lossy UTF-8 `String`
+                let image_name: String = parser.get("ImageName")?;
+                // Owned lossless WTF-8 `OsString`
+                let _image_name_wtf8: OsString = parser.get("ImageName")?;
+                // Borrowed raw UTF-16LE code units
+                let _image_name_utf16: WideStrRef = parser.as_ref("ImageName")?;
+
                 let parent_id: u32 = parser.get("ParentProcessID")?;
-                println!(
-                    "[+] Process started: {} (PID: {pid}, Parent: {parent_id})",
-                    image_name.display()
-                );
+                println!("[+] Process started: {image_name} (PID: {pid}, Parent: {parent_id})");
             }
 
             _ => {

@@ -18,7 +18,7 @@
 //! cargo run --example 02_static_schema
 //! ```
 
-use etw::{CP_ACP, Guid, Trace, provider_schema};
+use etw::{Guid, Trace, provider_schema};
 use std::time::Duration;
 
 const PROCESS_GUID: Guid = Guid::from_u128(0x22fb2cd6_0e7b_422b_a0c7_2fad1fd0e716);
@@ -122,10 +122,20 @@ fn main() -> etw::Result<()> {
 
                 // Note: ETW has two string types - UTF-16LE unicode strings (wide strings) and ANSI
                 // strings. Wide strings convert losslessly to `OsString`, since Windows permits
-                // unpaired surrogates that a UTF-8 `String` cannot hold. ANSI strings convert to
-                // `String` using the encoding their out-type implies — UTF-8 for `@ out(Utf8)`,
-                // otherwise the active code page — propagating any decoding errors.
-                let image_name = parser.ImageName()?.display().to_string();
+                // unpaired surrogates that a UTF-8 `String` cannot hold.
+                // With the static parser, the lossy conversion to UTF-8 decision must be explicit.
+                let image_name = parser.ImageName()?;
+                let image_name = image_name.to_string_lossy();
+
+                // WARNING: Converting to UTF-8 too early may introduce unexpected behaviours for
+                // some use cases. For example, NTFS performs case-insensitive equality checks using
+                // UTF-16 code units with a fixed, filesystem-defined case-folding table ($UpCase),
+                // without normalisation.
+                //
+                // Variable-length types can also be accessed by reference to avoid copying.
+                // This is the mechanism to access the raw pre-conversion string data.
+                // This supports early filtering scenarios, and explicit decoding scenarios.
+                let _image_name_ref = parser.ImageName_ref()?;
 
                 // SecurityMitigations was added in V4 — use a version check or handle
                 // Err(PropertyNotFound).
@@ -142,19 +152,14 @@ fn main() -> etw::Result<()> {
                 let pid = parser.ProcessID()?;
                 let exit_code = parser.ExitCode()?;
 
-                // WARNING: Converting to UTF-8 too early may introduce unexpected behaviours for
-                // some use cases. For example, NTFS performs case-insensitive equality checks using
-                // UTF-16 code units with a fixed, filesystem-defined case-folding table ($UpCase),
-                // without normalisation.
-                //
-                // Variable-length types can also be accessed by reference to avoid copying.
-                // This is the mechanism to access the raw pre-conversion string data.
-                // This supports early filtering scenarios, and explicit decoding scenarios.
-                //
                 // ProcessStop's ImageName is the kernel's short image name, truncated to 15
-                // characters — unlike ProcessStart's full path.
-                let image_name_ref = parser.ImageName_ref()?;
-                let image_name = image_name_ref.decode(CP_ACP)?;
+                // characters — unlike ProcessStart's full path. It is an ANSI string: the owned
+                // `ImageName()` accessor converts it to `String` using the encoding its out-type
+                // implies — UTF-8 for `@ out(Utf8)`, otherwise the active code page —
+                // propagating any decoding errors.
+                let image_name = parser.ImageName()?;
+                // Access the raw bytes if the implicit decoding is wrong for the property.
+                let _image_name_cp1252 = parser.ImageName_ref()?.decode(1252)?;
 
                 println!("  Stop:  PID={pid} exit={exit_code} {image_name}");
             }

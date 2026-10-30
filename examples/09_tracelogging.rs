@@ -72,7 +72,6 @@ fn main() -> etw::Result<()> {
             return Ok(());
         }
 
-        // Both strings are UTF-16 (counted), so they are read as `OsString`.
         let image: OsString = parser.get("ImageFileName")?;
         let parent_pid: u32 = parser.get("ParentPid")?;
         let command_line: OsString = parser.get("CommandLine")?;

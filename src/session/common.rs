@@ -784,15 +784,18 @@ impl std::fmt::Debug for ThreadPriorityDisplay {
     }
 }
 
-/// Wrapper for displaying flush timer values (0 = OS minimum).
-pub struct FlushTimer(pub u32);
+/// Wrapper for displaying flush timer values (0 = OS default of one second).
+pub struct FlushTimer {
+    pub value: u32,
+    pub milliseconds: bool,
+}
 
 impl std::fmt::Debug for FlushTimer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.0 == 0 {
-            write!(f, "minimum (1s)")
-        } else {
-            write!(f, "{}s", self.0)
+        match (self.value, self.milliseconds) {
+            (0, _) => write!(f, "default (1s)"),
+            (n, true) => write!(f, "{n}ms"),
+            (n, false) => write!(f, "{n}s"),
         }
     }
 }
@@ -880,6 +883,7 @@ impl std::fmt::Debug for LogFileModeFlags {
         const EVENT_TRACE_FILE_MODE_CIRCULAR: u32 = 0x0000_0002;
         const EVENT_TRACE_FILE_MODE_APPEND: u32 = 0x0000_0004;
         const EVENT_TRACE_FILE_MODE_NEWFILE: u32 = 0x0000_0008;
+        const EVENT_TRACE_USE_MS_FLUSH_TIMER: u32 = 0x0000_0010;
         const EVENT_TRACE_FILE_MODE_PREALLOCATE: u32 = 0x0000_0020;
         const EVENT_TRACE_NONSTOPPABLE_MODE: u32 = 0x0000_0040;
         const EVENT_TRACE_SECURE_MODE: u32 = 0x0000_0080;
@@ -914,6 +918,7 @@ impl std::fmt::Debug for LogFileModeFlags {
         check_flag!(EVENT_TRACE_FILE_MODE_CIRCULAR, "CIRCULAR");
         check_flag!(EVENT_TRACE_FILE_MODE_APPEND, "APPEND");
         check_flag!(EVENT_TRACE_FILE_MODE_NEWFILE, "NEWFILE");
+        check_flag!(EVENT_TRACE_USE_MS_FLUSH_TIMER, "USE_MS_FLUSH_TIMER");
         check_flag!(EVENT_TRACE_FILE_MODE_PREALLOCATE, "PREALLOCATE");
         check_flag!(EVENT_TRACE_NONSTOPPABLE_MODE, "NONSTOPPABLE");
         check_flag!(EVENT_TRACE_SECURE_MODE, "SECURE");
@@ -1416,8 +1421,14 @@ mod tests {
 
     #[test]
     fn test_flush_timer_display() {
-        assert_eq!(format!("{:?}", FlushTimer(0)), "minimum (1s)");
-        assert_eq!(format!("{:?}", FlushTimer(3)), "3s");
+        let timer = |value, milliseconds| FlushTimer {
+            value,
+            milliseconds,
+        };
+        assert_eq!(format!("{:?}", timer(0, false)), "default (1s)");
+        assert_eq!(format!("{:?}", timer(3, false)), "3s");
+        assert_eq!(format!("{:?}", timer(0, true)), "default (1s)");
+        assert_eq!(format!("{:?}", timer(250, true)), "250ms");
     }
 
     #[test]
@@ -1541,6 +1552,7 @@ mod tests {
         let cases: &[(u32, &str)] = &[
             (0x0000_0004, "APPEND"),
             (0x0000_0008, "NEWFILE"),
+            (0x0000_0010, "USE_MS_FLUSH_TIMER"),
             (0x0000_0020, "PREALLOCATE"),
             (0x0000_0040, "NONSTOPPABLE"),
             (0x0000_0080, "SECURE"),

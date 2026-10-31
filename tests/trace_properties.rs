@@ -1,4 +1,5 @@
-//! Integration tests verifying that buffer configuration survives start().
+//! Integration tests verifying that buffer configuration survives start(), and that
+//! a millisecond flush timer governs delivery.
 //!
 //! These tests configure buffer properties, start a trace session, then
 //! verify the OS received the requested values (via properties readback).
@@ -15,7 +16,14 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use etw::Trace;
+use etw::{Trace, session::NO_PER_PROCESSOR_BUFFERING};
+use example_providers::kernel::process;
+use std::{
+    process::Command,
+    sync::{Arc, Mutex},
+    thread::sleep,
+    time::{Duration, Instant},
+};
 
 /// Test that Trace buffer configuration survives start().
 #[test]
@@ -54,6 +62,82 @@ fn test_realtime_trace_buffer_config() {
         props.MinimumBuffers
     );
     assert_eq!(props.FlushTimer, 2, "FlushTimer should survive start()");
+
+    trace.stop().expect("Failed to stop session");
+}
+
+/// The millisecond flush timer rests on an undocumented `LogFileMode` bit, so check
+/// both that the kernel keeps it and that delivery actually follows it.
+#[test]
+fn test_realtime_flush_timer_ms() {
+    const USE_MS_FLUSH_TIMER: u32 = 0x10;
+    const FLUSH_MS: u32 = 50;
+    // Seconds-unit or ignored bit would put this at >= 1 s.
+    const MAX_LATENCY: Duration = Duration::from_millis(500);
+
+    let mut trace = Trace::new("etw-rs_Test_RT_MsFlush").expect("Failed to create trace session");
+    let _ = trace
+        .set_log_file_mode(NO_PER_PROCESSOR_BUFFERING)
+        .set_flush_timer_ms(FLUSH_MS);
+
+    let seen: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_cb = Arc::clone(&seen);
+    trace.set_event_callback(move |event, context| {
+        if event.id() == process::event::PROCESS_START {
+            let pid: u32 = context.parser(event)?.get("ProcessID")?;
+            seen_cb.lock().expect("lock").push(pid);
+        }
+        Ok(())
+    });
+
+    let Some(()) =
+        common::skip_or_panic("start_processing_thread", trace.start_processing_thread())
+    else {
+        return;
+    };
+
+    let props = trace.properties();
+    assert_ne!(
+        props.LogFileMode & USE_MS_FLUSH_TIMER,
+        0,
+        "kernel dropped the ms flush timer bit"
+    );
+    assert_eq!(
+        props.FlushTimer, FLUSH_MS,
+        "FlushTimer should survive start()"
+    );
+
+    let Some(()) = common::skip_or_panic(
+        "enable_provider",
+        trace.enable_provider(process::GUID, process::keyword::PROCESS),
+    ) else {
+        return;
+    };
+
+    let mut worst = Duration::ZERO;
+    for _ in 0..3 {
+        let mut child = Command::new("cmd.exe")
+            .args(["/c", "exit"])
+            .spawn()
+            .expect("Failed to spawn cmd.exe");
+        let pid = child.id();
+        let _ = child.wait();
+        let spawned = Instant::now();
+        while !seen.lock().expect("lock").contains(&pid) {
+            assert!(
+                spawned.elapsed() < Duration::from_secs(5),
+                "no ProcessStart for PID {pid}"
+            );
+            sleep(Duration::from_millis(5));
+        }
+        worst = worst.max(spawned.elapsed());
+    }
+    println!("Worst delivery latency with a {FLUSH_MS} ms flush timer: {worst:?}");
+    assert!(
+        worst < MAX_LATENCY,
+        "delivery took {worst:?} with a {FLUSH_MS} ms flush timer; the kernel is not honouring \
+         EVENT_TRACE_USE_MS_FLUSH_TIMER"
+    );
 
     trace.stop().expect("Failed to stop session");
 }

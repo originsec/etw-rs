@@ -60,6 +60,11 @@ const MAX_EXTENSION_SIZE: usize = 4 // Extension header
 /// `EVENT_TRACE_SYSTEM_LOGGER_MODE` flag for system logger sessions.
 const EVENT_TRACE_SYSTEM_LOGGER_MODE: u32 = 0x0200_0000;
 
+/// Undocumented `LogFileMode` bit making the kernel read `FlushTimer` as
+/// milliseconds; named in the Windows 10 (10240) kit's `ntwmi.h`. Owned by the
+/// flush timer setters, so not exported.
+const EVENT_TRACE_USE_MS_FLUSH_TIMER: u32 = 0x0000_0010;
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Public API Types
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -893,6 +898,9 @@ impl Trace {
     /// Set the log mode flags. Always sets `EVENT_TRACE_REAL_TIME_MODE` and
     /// `EVENT_TRACE_INDEPENDENT_SESSION_MODE`.
     ///
+    /// The flush timer unit is left as the flush timer setters chose it: bit `0x10`
+    /// in `mode` is ignored. See [`set_flush_timer_ms()`](Self::set_flush_timer_ms).
+    ///
     /// Must be called before [`start()`](Self::start).
     ///
     /// # Panics
@@ -904,8 +912,11 @@ impl Trace {
             !self.is_started(),
             "Cannot modify log file mode after start()"
         );
-        self.props_buf.properties.LogFileMode =
-            mode | EVENT_TRACE_REAL_TIME_MODE | EVENT_TRACE_INDEPENDENT_SESSION_MODE;
+        let ms_unit = self.props_buf.properties.LogFileMode & EVENT_TRACE_USE_MS_FLUSH_TIMER;
+        self.props_buf.properties.LogFileMode = (mode & !EVENT_TRACE_USE_MS_FLUSH_TIMER)
+            | ms_unit
+            | EVENT_TRACE_REAL_TIME_MODE
+            | EVENT_TRACE_INDEPENDENT_SESSION_MODE;
         self
     }
 
@@ -963,7 +974,9 @@ impl Trace {
         self
     }
 
-    /// Set the flush timer in seconds.
+    /// Set the flush timer in seconds. 0 means the ETW default of one second.
+    ///
+    /// Replaces any [`set_flush_timer_ms()`](Self::set_flush_timer_ms) setting.
     ///
     /// Must be called before [`start()`](Self::start).
     ///
@@ -976,7 +989,48 @@ impl Trace {
             !self.is_started(),
             "Cannot modify flush timer after start()"
         );
+        self.props_buf.properties.LogFileMode &= !EVENT_TRACE_USE_MS_FLUSH_TIMER;
         self.props_buf.properties.FlushTimer = seconds;
+        self
+    }
+
+    /// Set the flush timer in milliseconds, for sub-second realtime delivery.
+    ///
+    /// The flush timer bounds how long an event can sit in a partly filled buffer
+    /// before it reaches the consumer, so on a low-volume session it is effectively
+    /// the delivery latency. Measured worst case is one interval with
+    /// [`NO_PER_PROCESSOR_BUFFERING`](super::NO_PER_PROCESSOR_BUFFERING) and two
+    /// without.
+    ///
+    /// **Undocumented.** This sets `EVENT_TRACE_USE_MS_FLUSH_TIMER` (`0x10`), a
+    /// `LogFileMode` bit defined in the Windows 10 (10240) kit's `ntwmi.h`
+    /// ("LoggerMode flags on Win7 and above"), but no longer in current SDK
+    /// headers. Windows uses it for its own sessions, but Microsoft makes no
+    /// compatibility promise. Prefer
+    /// [`set_flush_timer()`](Self::set_flush_timer) unless sub-second delivery
+    /// matters.
+    ///
+    /// The kernel applies no minimum, but the timer fires on clock ticks: 15.625 ms
+    /// by default, finer only while some process has raised the system timer
+    /// resolution. Small values cost wake-ups. 0 means the ETW default of one
+    /// second, not the shortest interval. The unit is fixed once the session
+    /// starts. Replaces any `set_flush_timer()` setting, and is itself replaced by a
+    /// later `set_flush_timer()` or
+    /// [`set_buffer_configuration()`](Self::set_buffer_configuration).
+    ///
+    /// Must be called before [`start()`](Self::start).
+    ///
+    /// # Panics
+    ///
+    /// Panics if called after `start()`.
+    #[must_use]
+    pub fn set_flush_timer_ms(&mut self, milliseconds: u32) -> &mut Self {
+        assert!(
+            !self.is_started(),
+            "Cannot modify flush timer after start()"
+        );
+        self.props_buf.properties.LogFileMode |= EVENT_TRACE_USE_MS_FLUSH_TIMER;
+        self.props_buf.properties.FlushTimer = milliseconds;
         self
     }
 
@@ -1038,6 +1092,9 @@ impl Trace {
     }
 
     /// Set all buffer parameters at once.
+    ///
+    /// The flush timer is set as by [`set_flush_timer()`](Self::set_flush_timer),
+    /// in seconds, replacing any [`set_flush_timer_ms()`](Self::set_flush_timer_ms).
     ///
     /// Must be called before [`start()`](Self::start).
     ///
@@ -1844,7 +1901,12 @@ impl std::fmt::Debug for Trace {
             )
             .field(
                 "flush_timer",
-                &FlushTimer(self.props_buf.properties.FlushTimer),
+                &FlushTimer {
+                    value: self.props_buf.properties.FlushTimer,
+                    milliseconds: self.props_buf.properties.LogFileMode
+                        & EVENT_TRACE_USE_MS_FLUSH_TIMER
+                        != 0,
+                },
             )
             .field(
                 "buffer_size",
@@ -2093,6 +2155,58 @@ mod tests {
         assert_eq!(session.props_buf.properties.MinimumBuffers, 4);
         assert_eq!(session.props_buf.properties.MaximumBuffers, 16);
         assert_eq!(session.props_buf.properties.FlushTimer, 2);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "ETW session creation reaches TDH (Win32)")]
+    fn test_flush_timer_unit_follows_last_setter() {
+        let mut session = Trace::new("TestFlushUnit").expect("session creation");
+        let ms_unit =
+            |s: &Trace| s.props_buf.properties.LogFileMode & EVENT_TRACE_USE_MS_FLUSH_TIMER;
+
+        let _ = session.set_flush_timer_ms(250);
+        assert_eq!(session.props_buf.properties.FlushTimer, 250);
+        assert_ne!(ms_unit(&session), 0);
+
+        let _ = session.set_flush_timer(2);
+        assert_eq!(session.props_buf.properties.FlushTimer, 2);
+        assert_eq!(ms_unit(&session), 0);
+
+        let _ = session
+            .set_flush_timer_ms(250)
+            .set_buffer_configuration(64, 4, 16, 3);
+        assert_eq!(session.props_buf.properties.FlushTimer, 3);
+        assert_eq!(ms_unit(&session), 0);
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "ETW session creation reaches TDH (Win32)")]
+    fn test_set_log_file_mode_leaves_flush_unit_alone() {
+        let mut session = Trace::new("TestFlushUnitMode").expect("session creation");
+        let ms_unit =
+            |s: &Trace| s.props_buf.properties.LogFileMode & EVENT_TRACE_USE_MS_FLUSH_TIMER;
+
+        let _ = session.set_flush_timer_ms(100).set_log_file_mode(0);
+        assert_ne!(
+            ms_unit(&session),
+            0,
+            "set_log_file_mode cleared the ms unit"
+        );
+
+        let _ = session
+            .set_flush_timer(1)
+            .set_log_file_mode(EVENT_TRACE_USE_MS_FLUSH_TIMER);
+        assert_eq!(ms_unit(&session), 0, "set_log_file_mode set the ms unit");
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "ETW session creation reaches TDH (Win32)")]
+    fn test_debug_shows_flush_timer_unit() {
+        let mut session = Trace::new("TestFlushUnitDebug").expect("session creation");
+        let _ = session.set_flush_timer_ms(100);
+        let s = format!("{session:?}");
+        assert!(s.contains("flush_timer: 100ms"), "got: {s}");
+        assert!(s.contains("USE_MS_FLUSH_TIMER"), "got: {s}");
     }
 
     #[test]

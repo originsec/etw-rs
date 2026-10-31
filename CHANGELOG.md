@@ -7,6 +7,8 @@
 - `ProcessingContext::tracelogging_parser()` for TraceLogging events.
 - `get::<OsString>()` decodes wide strings losslessly.
 - `WideStrRef::{starts_with,ends_with,contains}_ascii_ignore_case()`.
+- `Trace::set_flush_timer_ms()` for sub-second realtime delivery, via the
+  undocumented `EVENT_TRACE_USE_MS_FLUSH_TIMER` mode bit.
 
 ### Changed
 

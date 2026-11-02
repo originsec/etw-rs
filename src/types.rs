@@ -617,6 +617,16 @@ pub(crate) fn is_ascii_only(data: &[u8]) -> bool {
     data.iter().all(|&b| b < 0x80)
 }
 
+/// Lossless UTF-16 to `OsString`.
+///
+/// `String::from_utf16` decodes faster than `OsString::from_wide`, and a `String`
+/// moves into an `OsString` without reallocating, so only an unpaired surrogate,
+/// which UTF-8 cannot hold, pays for `from_wide`.
+fn os_string_from_wide(wide: &[u16]) -> std::ffi::OsString {
+    use std::os::windows::ffi::OsStringExt;
+    String::from_utf16(wide).map_or_else(|_| std::ffi::OsString::from_wide(wide), Into::into)
+}
+
 // =============================================================================
 // WideStrRef - Zero-Copy UTF-16LE String
 // =============================================================================
@@ -824,9 +834,8 @@ impl<'a> WideStrRef<'a> {
     /// which Windows permits in file names, registry keys and other identifiers.
     #[must_use]
     pub fn to_os_string(&self) -> std::ffi::OsString {
-        use std::os::windows::ffi::OsStringExt;
         if let Some(wide) = self.as_wide_slice() {
-            return std::ffi::OsString::from_wide(wide);
+            return os_string_from_wide(wide);
         }
         let wide: Vec<u16> = self
             .data
@@ -835,7 +844,7 @@ impl<'a> WideStrRef<'a> {
             .iter()
             .map(|c| u16::from_le_bytes([c[0], c[1]]))
             .collect();
-        std::ffi::OsString::from_wide(&wide)
+        os_string_from_wide(&wide)
     }
 
     /// Compare against an ASCII string without allocation.
@@ -1430,8 +1439,7 @@ impl WideString {
     /// See [`WideStrRef::to_os_string`].
     #[must_use]
     pub fn to_os_string(&self) -> std::ffi::OsString {
-        use std::os::windows::ffi::OsStringExt;
-        std::ffi::OsString::from_wide(&self.data)
+        os_string_from_wide(&self.data)
     }
 
     /// Borrow as a `WideStrRef`.
@@ -3485,6 +3493,19 @@ mod tests {
             w.to_os_string().encode_wide().collect::<Vec<_>>(),
             [0x48, 0xD800]
         );
+    }
+
+    #[test]
+    fn wide_str_ref_to_os_string_valid_utf16_matches_from_wide() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        // ASCII, a BMP character (é), and a surrogate pair (U+1F600).
+        let units = [0x48, 0xE9, 0xD83D, 0xDE00, 0x69];
+        let owned = WideString::from_vec(units.to_vec());
+        let w = owned.as_wide_str();
+        let os = w.to_os_string();
+        assert_eq!(os, std::ffi::OsString::from_wide(&units));
+        assert_eq!(os.encode_wide().collect::<Vec<_>>(), units);
+        assert_eq!(owned.to_os_string(), os);
     }
 
     #[test]

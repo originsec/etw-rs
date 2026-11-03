@@ -172,15 +172,33 @@ either. Use `round_robin.py`, which runs a paired design:
 - **Enough pairs, with the standard error reported.** The standard error falls as
   1/√pairs, and the report states it, so a result carries its own resolving
   power. A delta within two standard errors is reported as `within noise`.
+- **Both sides built the same way, with code alignment fixed.** Pairing cannot
+  remove a difference that is fixed in each binary, and code placement is one:
+  where a hot loop lands relative to instruction-fetch boundaries shifts when
+  unrelated code changes, enough to move a single arm by several percent. The
+  driver builds both refs itself, with `-align-all-functions=6` and
+  `-align-all-nofallthru-blocks=5`, so a delta reflects work rather than layout.
+  The precompiled standard library is not realigned.
 
 ```bash
-# Keep the baseline binary out of target/release/deps/ before rebuilding.
 python benches/round_robin.py \
-    --baseline  target/baseline-live_events.exe \
-    --candidate target/release/deps/live_events-<hash>.exe \
+    --baseline  v0.1.0 \
+    --candidate HEAD \
     --filter "registry_create_key/etw-rs-static" \
     --pairs 15
 ```
+
+Each ref is exported with `git archive` and built under `target/round_robin/<sha>`,
+with the checkout's `Cargo.lock` copied in so both sides use the same dependency
+versions. Commit a change to measure it: uncommitted edits are not in any ref, and
+the driver warns when either ref is a dirty `HEAD`. `--bench-target` picks a
+criterion target instead of `live_events`, and `--toolchain` pins both builds.
+Run it from the directory holding the `captured_*.bin` files, which the binaries
+read from their working directory.
+
+The aligned builds suit only this comparison. They are larger, and their absolute
+timings are not what a default build produces, so `BENCHMARKS.md` numbers come
+from a plain `cargo bench`.
 
 The driver sets `ETW_BENCH_SKIP_CPP=1` and `ETW_BENCH_PASSES=1`, because the C++
 arms and the built-in pass repetition add nothing to a Rust-vs-Rust comparison.

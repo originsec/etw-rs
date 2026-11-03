@@ -18,7 +18,14 @@ together with its standard error, so a result states its own resolving power
 instead of implying false precision -- and a standard error that jumps is the
 sign that the machine was not idle.
 
-Two details matter and are easy to get wrong:
+Pairing cannot remove a difference fixed in each binary. Where the linker places
+a hot loop relative to instruction-fetch boundaries moves when unrelated code
+changes, and it can move a single arm by several percent. The driver therefore
+builds both sides itself, from git refs, with every function and branch target
+aligned (`ALIGN_RUSTFLAGS`), so layout cannot pass for a code change. It does
+not reach the precompiled standard library.
+
+Three details matter and are easy to get wrong:
 
   * **Use each run's median, not its fastest sample.** Under criterion's Linear
     sampling `iters` ramps 1..N, so `times[i]/iters[i]` for the low-iteration
@@ -28,13 +35,16 @@ Two details matter and are easy to get wrong:
   * **Alternate which arm goes first (ABBA).** Always running base-then-cand
     hands the warm-up penalty to the same arm every round, which shows up as a
     systematic delta between identical binaries.
+  * **Build both sides the same way.** A hand-built baseline compared against a
+    candidate built with different flags, toolchain or dependency versions
+    measures the build, not the change.
 
 See "Comparing two builds" in benches/README.md for how to use it.
 
 Usage:
     python benches/round_robin.py \
-        --baseline  target/baseline-live_events.exe \
-        --candidate target/release/deps/live_events-<hash>.exe \
+        --baseline  v0.1.0 \
+        --candidate HEAD \
         --filter "registry_create_key/etw-rs-static" \
         --pairs 15
 """
@@ -42,6 +52,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import math
 import os
@@ -50,7 +61,65 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+# 64-byte functions and 32-byte branch targets: a hot loop then starts on the
+# same fetch boundary in both builds, whatever code moved around it.
+ALIGN_RUSTFLAGS = "-C llvm-args=-align-all-functions=6 -C llvm-args=-align-all-nofallthru-blocks=5"
+
+
+def git(*args: str) -> str:
+    proc = subprocess.run(["git", *args], cwd=REPO, capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.exit(f"git {' '.join(args)} failed:\n{proc.stderr}")
+    return proc.stdout.strip()
+
+
+def build(ref: str, bench: str, build_dir: Path, toolchain: str | None) -> Path:
+    """Export `ref` with `git archive`, build its `bench` target aligned, return the exe.
+
+    Each commit gets its own source tree and target directory under `build_dir`, so
+    a rerun against the same commit reuses its build. The checkout's `Cargo.lock`,
+    which git ignores, is copied into both trees so the two sides resolve the same
+    dependency versions.
+    """
+    sha = git("rev-parse", "--verify", f"{ref}^{{commit}}")
+    root = build_dir / sha[:12]
+    src = root / "src"
+    if not (src / "Cargo.toml").is_file():
+        archive = subprocess.run(["git", "archive", "--format=tar", sha], cwd=REPO, capture_output=True)
+        if archive.returncode != 0:
+            sys.exit(f"git archive {sha} failed:\n{archive.stderr.decode(errors='replace')}")
+        src.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tar:
+            tar.extractall(src, filter="data")
+    lock = REPO / "Cargo.lock"
+    if lock.is_file():
+        shutil.copyfile(lock, src / "Cargo.lock")
+
+    env = dict(os.environ)
+    env["CARGO_TARGET_DIR"] = str(root / "target")
+    env["RUSTFLAGS"] = f"{env.get('RUSTFLAGS', '')} {ALIGN_RUSTFLAGS}".strip()
+    cmd = ["cargo", *([f"+{toolchain}"] if toolchain else []), "bench", "--bench", bench, "--no-run",
+           "--message-format=json-render-diagnostics"]
+    print(f"  building {ref} ({sha[:12]}) ... ", end="", flush=True)
+    proc = subprocess.run(cmd, cwd=src, env=env, capture_output=True, text=True)
+    if proc.returncode != 0:
+        sys.exit(f"build of {ref} failed:\n{proc.stderr[-4000:]}")
+    for line in proc.stdout.splitlines():
+        try:
+            msg = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        target = msg.get("target", {})
+        if (msg.get("reason") == "compiler-artifact" and "bench" in target.get("kind", [])
+                and target.get("name") == bench and msg.get("executable")):
+            print("done")
+            return Path(msg["executable"])
+    sys.exit(f"build of {ref} produced no `{bench}` bench executable")
 
 
 def run_arm(exe: Path, label: str, filt: str, extra: list[str]) -> str:
@@ -133,9 +202,17 @@ def discover(criterion_dir: Path, label: str) -> list[tuple[str, str]]:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--baseline", required=True, type=Path)
-    ap.add_argument("--candidate", required=True, type=Path)
+    ap.add_argument("--baseline", required=True, help="git ref to build as the baseline")
+    ap.add_argument("--candidate", required=True, help="git ref to build as the candidate")
     ap.add_argument("--filter", required=True, help="criterion benchmark filter")
+    ap.add_argument("--bench-target", default="live_events", help="bench target to build (default live_events)")
+    ap.add_argument(
+        "--build-dir",
+        type=Path,
+        default=REPO / "target" / "round_robin",
+        help="where each ref's source tree and build go (default target/round_robin)",
+    )
+    ap.add_argument("--toolchain", help="rustup toolchain for both builds, e.g. stable")
     ap.add_argument(
         "--pairs",
         type=int,
@@ -152,10 +229,13 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    for exe in (args.baseline, args.candidate):
-        if not exe.is_file():
-            print(f"not a file: {exe}", file=sys.stderr)
-            return 2
+    head = git("rev-parse", "HEAD")
+    if git("status", "--porcelain", "--untracked-files=no") and head in (
+        git("rev-parse", "--verify", f"{ref}^{{commit}}") for ref in (args.baseline, args.candidate)
+    ):
+        print("  warning: uncommitted changes are not built; commit them to measure them", file=sys.stderr)
+    baseline = build(args.baseline, args.bench_target, args.build_dir, args.toolchain)
+    candidate = build(args.candidate, args.bench_target, args.build_dir, args.toolchain)
 
     criterion_dir = args.target_dir / "criterion"
 
@@ -185,7 +265,7 @@ def main() -> int:
     for r in range(1, args.pairs + 1):
         order = ("base", "cand") if r % 2 else ("cand", "base")
         for arm in order:
-            exe = args.baseline if arm == "base" else args.candidate
+            exe = baseline if arm == "base" else candidate
             print(f"  round {r}/{args.pairs}  {arm} ... ", end="", flush=True)
             reported[(arm, r)] = parse_rows(run_arm(exe, f"{arm}_r{r}", args.filter, args.bench_arg))
             print("done")

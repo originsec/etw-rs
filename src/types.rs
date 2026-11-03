@@ -617,14 +617,44 @@ pub(crate) fn is_ascii_only(data: &[u8]) -> bool {
     data.iter().all(|&b| b < 0x80)
 }
 
+/// Length of the leading run of ASCII code units.
+fn ascii_prefix_len(wide: &[u16]) -> usize {
+    let mut len = 0;
+    for chunk in wide.chunks_exact(8) {
+        if chunk.iter().fold(0, |acc, &unit| acc | unit) >= 0x80 {
+            break;
+        }
+        len += 8;
+    }
+    len + wide[len..]
+        .iter()
+        .position(|&unit| unit >= 0x80)
+        .unwrap_or(wide.len() - len)
+}
+
 /// Lossless UTF-16 to `OsString`.
 ///
-/// `String::from_utf16` decodes faster than `OsString::from_wide`, and a `String`
-/// moves into an `OsString` without reallocating, so only an unpaired surrogate,
-/// which UTF-8 cannot hold, pays for `from_wide`.
+/// The ASCII prefix, all of a typical path, is narrowed in bulk; the rest is decoded
+/// into capacity reserved up front, which `OsString::from_wide` and
+/// `String::from_utf16` both lack. A `String` moves into an `OsString` without
+/// reallocating, so only an unpaired surrogate, which UTF-8 cannot hold, pays for
+/// `from_wide`.
 fn os_string_from_wide(wide: &[u16]) -> std::ffi::OsString {
     use std::os::windows::ffi::OsStringExt;
-    String::from_utf16(wide).map_or_else(|_| std::ffi::OsString::from_wide(wide), Into::into)
+    let ascii = ascii_prefix_len(wide);
+    // A UTF-16 code unit becomes at most three UTF-8 bytes.
+    let mut bytes = Vec::with_capacity(ascii + (wide.len() - ascii) * 3);
+    bytes.extend(wide[..ascii].iter().map(|&unit| unit as u8));
+    let Ok(mut s) = String::from_utf8(bytes) else {
+        return std::ffi::OsString::from_wide(wide);
+    };
+    for c in char::decode_utf16(wide[ascii..].iter().copied()) {
+        let Ok(c) = c else {
+            return std::ffi::OsString::from_wide(wide);
+        };
+        s.push(c);
+    }
+    s.into()
 }
 
 // =============================================================================
@@ -3514,5 +3544,37 @@ mod tests {
     #[test]
     fn wide_str_ref_to_os_string_empty() {
         assert!(WideStrRef::new(&[]).to_os_string().is_empty());
+    }
+
+    #[test]
+    fn os_string_from_wide_matches_std_across_ascii_chunk_boundaries() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        // The last ASCII unit, the first non-ASCII one, 2- and 3-byte UTF-8
+        // units, a surrogate pair, and lone surrogates of both kinds.
+        let inserts: [&[u16]; 7] = [
+            &[0x7F],
+            &[0x80],
+            &[0x7FF],
+            &[0x800],
+            &[0xD83D, 0xDE00],
+            &[0xD800],
+            &[0xDC00],
+        ];
+        for len in 0..=20 {
+            let ascii: Vec<u16> = (0..len).map(|i| u16::from(b'a') + i % 26).collect();
+            assert_eq!(
+                os_string_from_wide(&ascii),
+                std::ffi::OsString::from_wide(&ascii)
+            );
+            for at in 0..=len as usize {
+                for insert in inserts {
+                    let mut units = ascii.clone();
+                    units.splice(at..at, insert.iter().copied());
+                    let os = os_string_from_wide(&units);
+                    assert_eq!(os, std::ffi::OsString::from_wide(&units), "{units:x?}");
+                    assert_eq!(os.encode_wide().collect::<Vec<_>>(), units);
+                }
+            }
+        }
     }
 }

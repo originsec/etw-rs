@@ -834,6 +834,9 @@ impl<'a> WideStrRef<'a> {
     /// which Windows permits in file names, registry keys and other identifiers.
     #[must_use]
     pub fn to_os_string(&self) -> std::ffi::OsString {
+        if self.data.is_empty() {
+            return std::ffi::OsString::new();
+        }
         if let Some(wide) = self.as_wide_slice() {
             return os_string_from_wide(wide);
         }

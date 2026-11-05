@@ -639,6 +639,13 @@ fn ascii_prefix_len(wide: &[u16]) -> usize {
 /// `String::from_utf16` both lack. A `String` moves into an `OsString` without
 /// reallocating, so only an unpaired surrogate, which UTF-8 cannot hold, pays for
 /// `from_wide`.
+///
+/// rust-lang/rust#165027 reworks std's `OsString::from_wide` along similar lines.
+/// Once the MSRV reaches a release that includes it, benchmark the two on
+/// ETW-length strings before replacing this with a plain `from_wide`: its gains
+/// are concentrated on long and invalid input.
+///
+/// See: <https://github.com/rust-lang/rust/pull/165027>
 fn os_string_from_wide(wide: &[u16]) -> std::ffi::OsString {
     use std::os::windows::ffi::OsStringExt;
     let ascii = ascii_prefix_len(wide);

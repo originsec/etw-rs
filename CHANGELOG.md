@@ -14,6 +14,7 @@
 
 - **Breaking:** static wide-string accessors return `OsString`.
 - **Breaking:** `get::<String>()` decodes wide strings lossily.
+- SID authorities above `u32::MAX` display in hex, as Windows does.
 
 ### Fixed
 

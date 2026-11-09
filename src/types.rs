@@ -2060,11 +2060,30 @@ impl<'a> SidRef<'a> {
 
 /// Longest text a SID accepted by [`SidRef::new`] can render to.
 ///
-/// `"S-"`, a revision of up to 3 digits, `"-"`, the 15 digits of a 48-bit authority,
-/// and the SID maximum of 15 sub-authorities, each a `"-"` and up to 10 digits.
-/// Rendering anything longer falls back to the formatter, so this is a fast-path
-/// budget rather than a correctness limit.
-const SID_TEXT_CAPACITY: usize = 2 + 3 + 1 + 15 + 15 * 11;
+/// `"S-"`, a revision of up to 3 digits, `"-"`, a 48-bit authority (at widest `"0x"`
+/// and 12 hex digits), and the SID maximum of 15 sub-authorities, each a `"-"` and up
+/// to 10 digits. Rendering anything longer falls back to the formatter, so this is a
+/// fast-path budget rather than a correctness limit.
+const SID_TEXT_CAPACITY: usize = 2 + 3 + 1 + 14 + 15 * 11;
+
+/// Whether `ConvertSidToStringSidW` renders this identifier authority as `0x` and
+/// unpadded uppercase hex rather than decimal.
+const fn authority_is_hex(authority: u64) -> bool {
+    authority > u32::MAX as u64
+}
+
+/// Write the `S-{revision}-{authority}` prefix the way `ConvertSidToStringSidW` does.
+fn write_sid_prefix(
+    f: &mut std::fmt::Formatter<'_>,
+    revision: u8,
+    authority: u64,
+) -> std::fmt::Result {
+    if authority_is_hex(authority) {
+        write!(f, "S-{revision}-0x{authority:X}")
+    } else {
+        write!(f, "S-{revision}-{authority}")
+    }
+}
 
 /// A stack buffer that renders a SID without touching the formatting machinery.
 ///
@@ -2114,6 +2133,22 @@ impl SidText {
         Some(())
     }
 
+    /// Append an identifier authority as `ConvertSidToStringSidW` renders it, or
+    /// return `None` if it does not fit.
+    fn push_authority(&mut self, authority: u64) -> Option<()> {
+        if !authority_is_hex(authority) {
+            return self.push_decimal(authority);
+        }
+        self.push(b'0')?;
+        self.push(b'x')?;
+        let nibbles = (u64::BITS - authority.leading_zeros()).div_ceil(4);
+        for shift in (0..nibbles).rev() {
+            let nibble = ((authority >> (shift * 4)) & 0xF) as usize;
+            self.push(b"0123456789ABCDEF"[nibble])?;
+        }
+        Some(())
+    }
+
     /// Render a whole SID, or return `None` if it does not fit.
     fn push_sid(
         &mut self,
@@ -2125,7 +2160,7 @@ impl SidText {
         self.push(b'-')?;
         self.push_decimal(u64::from(revision))?;
         self.push(b'-')?;
-        self.push_decimal(authority)?;
+        self.push_authority(authority)?;
         for sub in subs {
             self.push(b'-')?;
             self.push_decimal(u64::from(sub))?;
@@ -2161,7 +2196,7 @@ impl std::fmt::Display for SidRef<'_> {
 
         // `SidRef::new` bounds both the revision and the sub-authority count, so the
         // buffer always suffices in practice; this keeps output correct regardless.
-        write!(f, "S-{}-{}", self.revision(), authority_value)?;
+        write_sid_prefix(f, self.revision(), authority_value)?;
         for i in 0..count {
             if let Some(sub) = self.sub_authority(i) {
                 write!(f, "-{sub}")?;
@@ -2226,7 +2261,7 @@ impl std::fmt::Display for Sid {
         // The fields are public, so a `Sid` may hold more sub-authorities or a wider
         // revision than the SID specification allows. Those still format correctly,
         // just without the fast path.
-        write!(f, "S-{}-{}", self.revision, authority_value)?;
+        write_sid_prefix(f, self.revision, authority_value)?;
         for sub in &self.sub_authorities {
             write!(f, "-{sub}")?;
         }
@@ -2813,9 +2848,44 @@ mod tests {
             authority: [0xFF; 6],
             sub_authorities: vec![u32::MAX; 15],
         };
-        let expected = format!("S-1-281474976710655{}", "-4294967295".repeat(15));
+        let expected = format!("S-1-0xFFFFFFFFFFFF{}", "-4294967295".repeat(15));
         assert_eq!(format!("{sid}"), expected);
         assert_eq!(expected.len(), SID_TEXT_CAPACITY - 2);
+    }
+
+    #[test]
+    fn sid_display_authority_matches_convert_sid_to_string_sid() {
+        // Expected text is what ConvertSidToStringSidW returns for each authority
+        // (observed on Windows 11 26200): decimal up to u32::MAX, unpadded uppercase
+        // hex above it.
+        let cases: [([u8; 6], &str); 6] = [
+            ([0, 0, 0, 0, 0, 5], "5"),
+            ([0, 0, 0x80, 0, 0, 0], "2147483648"),
+            ([0, 0, 0xFF, 0xFF, 0xFF, 0xFF], "4294967295"),
+            ([0, 1, 0, 0, 0, 0], "0x100000000"),
+            ([0, 0x0A, 0xBC, 0xDE, 0xF0, 0x12], "0xABCDEF012"),
+            ([1, 0, 0, 0, 0, 0], "0x10000000000"),
+        ];
+        for (authority, text) in cases {
+            let mut bytes = vec![1, 1];
+            bytes.extend_from_slice(&authority);
+            bytes.extend_from_slice(&18u32.to_le_bytes());
+            let expected = format!("S-1-{text}-18");
+            let sid_ref = SidRef::new(&bytes).expect("valid SID");
+            assert_eq!(sid_ref.to_string(), expected);
+            assert_eq!(sid_ref.to_owned().to_string(), expected);
+
+            let oversized = Sid {
+                revision: 1,
+                authority,
+                sub_authorities: vec![7; 64],
+            };
+            assert_eq!(
+                oversized.to_string(),
+                format!("S-1-{text}{}", "-7".repeat(64)),
+                "fallback path"
+            );
+        }
     }
 
     #[test]

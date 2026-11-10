@@ -8,6 +8,9 @@ Low-level Rust bindings for Event Tracing for Windows (ETW) with minimal abstrac
 
 This gives you near direct control over ETW session management and event consumption behind a safe API.
 
+For the motivation and design, see the blog post
+[Introducing etw-rs](https://www.originhq.com/research/introducing-etw-rs).
+
 ## Features
 
 - **Minimal Abstraction**: API surface closely mirrors Win32 ETW APIs

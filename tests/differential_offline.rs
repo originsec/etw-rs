@@ -376,6 +376,9 @@ fn edge_records() -> Vec<Fixture> {
         ("SidRevision2", invalid_sid(2, 2)),
         ("SidCount16", invalid_sid(1, 16)),
         ("SidCount255", invalid_sid(1, 255)),
+        // Revision 0 with a zero authority and no sub-authorities: the same fields
+        // as a WbemSid's missing SID, but a real SID, rendered in hex.
+        ("SidAllZero", vec![0; 8]),
     ] {
         out.push(Fixture {
             label: label.to_owned(),
@@ -823,9 +826,9 @@ fn sid_display_agrees_with_tdh_format_property() {
         "SID display disagrees with TdhFormatProperty:\n{}",
         problems.join("\n")
     );
-    // The four scalar shapes, the empty SID, and the four invalid SIDs.
+    // The four scalar shapes, the empty SID, and the five invalid SIDs.
     assert_eq!(
-        checked, 9,
+        checked, 10,
         "expected every scalar SID fixture to be compared"
     );
 }
@@ -1006,7 +1009,7 @@ fn fixture_set_covers_the_expected_surface() {
         "shape matrix should be every in-type in every shape"
     );
     assert_eq!(linkage_records().len(), 12, "linkage fixture count changed");
-    assert_eq!(edge_records().len(), 11, "edge-case fixture count changed");
+    assert_eq!(edge_records().len(), 12, "edge-case fixture count changed");
 
     let per_type: usize = Shape::ALL.iter().map(|s| s.property_count()).sum();
     // ParamLength 4, ParamCount 4, TwoStrings 4, AnsiThenUnicode 4, UnicodeThenAnsi 4,
@@ -1014,11 +1017,11 @@ fn fixture_set_covers_the_expected_surface() {
     // ParamLengthAfterVariable 5, ParamCountAfterVariable 5, ParamLengthAndCount 5,
     // ParamLengthStaticCount 4.
     let expected_linkage = 49usize;
-    // Three empty variable fields and four invalid SIDs in the Fixed shape (3 each),
+    // Three empty variable fields and five invalid SIDs in the Fixed shape (3 each),
     // three count == 0 arrays in the ArrayParamCount shape (4 each), one zero-length
     // ParamLength (4).
     let expected_edge =
-        7 * Shape::Fixed.property_count() + 3 * Shape::ArrayParamCount.property_count() + 4;
+        8 * Shape::Fixed.property_count() + 3 * Shape::ArrayParamCount.property_count() + 4;
 
     let mut compared = 0usize;
     for f in all_records() {

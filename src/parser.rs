@@ -2729,10 +2729,10 @@ mod tests {
         ];
         let result = Sid::from_property(&data, TdhInType::Sid, TdhOutType::Null)
             .expect("parse should succeed");
-        assert_eq!(result.revision, 1);
-        assert_eq!(result.sub_authorities.len(), 2);
-        assert_eq!(result.sub_authorities[0], 21);
-        assert_eq!(result.sub_authorities[1], 1234567890);
+        assert_eq!(result.revision(), 1);
+        assert_eq!(result.sub_authorities().len(), 2);
+        assert_eq!(result.sub_authorities()[0], 21);
+        assert_eq!(result.sub_authorities()[1], 1234567890);
         assert_eq!(result.to_string(), "S-1-5-21-1234567890");
     }
 
@@ -2749,12 +2749,12 @@ mod tests {
 
         for revision in [0, 2, 255] {
             let read = parse(&sid(revision, &[18])).expect("invalid SIDs still read");
-            assert_eq!(read.revision, revision);
+            assert_eq!(read.revision(), revision);
             assert!(!read.is_valid());
         }
         for count in [16, 255] {
             let read = parse(&sid(1, &vec![1; count])).expect("invalid SIDs still read");
-            assert_eq!(read.sub_authorities.len(), count);
+            assert_eq!(read.sub_authorities().len(), count);
             assert!(!read.is_valid());
         }
 
@@ -3847,7 +3847,7 @@ mod position_tests {
 
         let mut parser = EventParser::from_raw_parts(&data, &schema, &mut cache);
         let val: Sid = parser.get("Target").unwrap();
-        assert_eq!(val.sub_authorities[0], 21);
+        assert_eq!(val.sub_authorities()[0], 21);
         let sentinel: u32 = parser.get("Sentinel").unwrap();
         assert_eq!(sentinel, 0xABCD);
     }
@@ -3867,7 +3867,7 @@ mod position_tests {
 
         let mut parser = EventParser::from_raw_parts(&data, &schema, &mut cache);
         let val: Sid = parser.get("Target").unwrap();
-        assert_eq!(val.sub_authorities, vec![10, 20]);
+        assert_eq!(val.sub_authorities(), [10, 20]);
         let sentinel: u32 = parser.get("Sentinel").unwrap();
         assert_eq!(sentinel, 0xBBBB);
     }

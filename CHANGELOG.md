@@ -14,6 +14,7 @@
 
 - **Breaking:** static wide-string accessors return `OsString`.
 - **Breaking:** `get::<String>()` decodes wide strings lossily.
+- **Breaking:** `Sid`'s fields are private; use `Sid::new` and its accessors.
 - **Breaking:** an invalid SID is read rather than rejected. `is_valid()` reports
   it, and it displays as hex, as `TdhFormatProperty` does.
 - SID authorities above `u32::MAX` display in hex, as Windows does.

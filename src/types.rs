@@ -2094,6 +2094,7 @@ impl<'a> SidRef<'a> {
             revision: self.revision(),
             authority: *self.authority(),
             sub_authorities,
+            missing: self.is_missing(),
         }
     }
 }
@@ -2284,21 +2285,49 @@ impl std::fmt::Debug for SidRef<'_> {
 /// Windows would accept it, and `Display` renders an invalid one in hex.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sid {
-    /// SID revision level. 1 is the only valid revision.
-    pub revision: u8,
-    /// 48-bit identifier authority value.
-    pub authority: [u8; 6],
-    /// Sub-authority values.
-    pub sub_authorities: Vec<u32>,
+    revision: u8,
+    authority: [u8; 6],
+    sub_authorities: Vec<u32>,
+    /// A missing SID's fields are all zero, which a real SID can also be.
+    missing: bool,
 }
 
 impl Sid {
+    /// A SID from its parts.
+    #[must_use]
+    pub const fn new(revision: u8, authority: [u8; 6], sub_authorities: Vec<u32>) -> Self {
+        Self {
+            revision,
+            authority,
+            sub_authorities,
+            missing: false,
+        }
+    }
+
     /// Parse a SID from raw bytes.
     ///
     /// Returns `None` only if the bytes are too short for the SID they describe.
     #[must_use]
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         SidRef::new(data).map(|r| r.to_owned())
+    }
+
+    /// SID revision level. 1 is the only valid revision.
+    #[must_use]
+    pub const fn revision(&self) -> u8 {
+        self.revision
+    }
+
+    /// 48-bit identifier authority value.
+    #[must_use]
+    pub const fn authority(&self) -> &[u8; 6] {
+        &self.authority
+    }
+
+    /// Sub-authority values.
+    #[must_use]
+    pub fn sub_authorities(&self) -> &[u32] {
+        &self.sub_authorities
     }
 
     /// Whether Windows would accept this SID; see [`SidRef::is_valid`].
@@ -2308,13 +2337,9 @@ impl Sid {
     }
 
     /// Whether this is a `WbemSid`'s missing SID; see [`SidRef::is_missing`].
-    ///
-    /// A missing SID converts to revision 0, a zero authority and no
-    /// sub-authorities, so an all-zero 8-byte SID — which no emitter writes — reads
-    /// as missing too.
     #[must_use]
-    pub fn is_missing(&self) -> bool {
-        self.revision == 0 && self.authority == [0; 6] && self.sub_authorities.is_empty()
+    pub const fn is_missing(&self) -> bool {
+        self.missing
     }
 }
 
@@ -2931,8 +2956,8 @@ mod tests {
             0x12, 0x00, 0x00, 0x00,
         ];
         let sid = Sid::from_bytes(&bytes).expect("valid SID");
-        assert_eq!(sid.revision, 1);
-        assert_eq!(sid.sub_authorities, vec![18]);
+        assert_eq!(sid.revision(), 1);
+        assert_eq!(sid.sub_authorities(), [18]);
         assert_eq!(format!("{sid}"), "S-1-5-18");
     }
 
@@ -2940,11 +2965,7 @@ mod tests {
     fn sid_owned_display_widest_in_spec() {
         // The fast-path buffer is sized for exactly this: the 15 sub-authority maximum,
         // each at the widest a u32 renders, on top of a full 48-bit authority.
-        let sid = Sid {
-            revision: 1,
-            authority: [0xFF; 6],
-            sub_authorities: vec![u32::MAX; 15],
-        };
+        let sid = Sid::new(1, [0xFF; 6], vec![u32::MAX; 15]);
         let expected = format!("S-1-0xFFFFFFFFFFFF{}", "-4294967295".repeat(15));
         assert_eq!(format!("{sid}"), expected);
         assert_eq!(expected.len(), SID_TEXT_CAPACITY - 2);
@@ -2985,11 +3006,7 @@ mod tests {
             assert_eq!(sid_ref.to_owned().to_string(), expected);
 
             // Too many sub-authorities for a wire form, so rendered as text.
-            let oversized = Sid {
-                revision: 1,
-                authority: *sid_ref.authority(),
-                sub_authorities: vec![7; 256],
-            };
+            let oversized = Sid::new(1, *sid_ref.authority(), vec![7; 256]);
             assert_eq!(
                 oversized.to_string(),
                 format!("S-1-{text}{}", "-7".repeat(256)),
@@ -3000,13 +3017,9 @@ mod tests {
 
     #[test]
     fn sid_owned_display_falls_back_past_buffer() {
-        // `Sid` has public fields, so it can hold more sub-authorities than any wire
-        // form (255) and overflow the fast path. Output must stay correct.
-        let sid = Sid {
-            revision: 1,
-            authority: [0, 0, 0, 0, 0, 5],
-            sub_authorities: vec![7; 256],
-        };
+        // `Sid::new` takes any number of sub-authorities, more than any wire form
+        // (255) and the fast path hold. Output must stay correct.
+        let sid = Sid::new(1, [0, 0, 0, 0, 0, 5], vec![7; 256]);
         let expected = format!("S-1-5{}", "-7".repeat(256));
         assert_eq!(format!("{sid}"), expected);
     }
@@ -3026,9 +3039,17 @@ mod tests {
         assert!(!owned.is_valid());
         assert_eq!(owned.to_string(), "0");
 
-        // A real SID is never missing, valid or not.
-        let header = make_sid(0, 0, &[]);
-        assert!(!SidRef::new(&header).expect("sized SID").is_missing());
+        // A real SID is never missing, valid or not — not even an all-zero one, which
+        // has the same fields as a missing SID but renders in hex.
+        let all_zero = make_sid(0, 0, &[]);
+        let sid = SidRef::new(&all_zero).expect("sized SID");
+        assert!(!sid.is_missing());
+        assert_eq!(sid.to_string(), "0x0000000000000000");
+        let owned = sid.to_owned();
+        assert!(!owned.is_missing());
+        assert_eq!(owned.to_string(), "0x0000000000000000");
+        assert_ne!(owned, SidRef::missing(&[0; 4]).to_owned());
+        assert!(!Sid::new(0, [0; 6], Vec::new()).is_missing());
         assert!(
             !SidRef::new(&make_sid(1, 5, &[18]))
                 .expect("sized SID")

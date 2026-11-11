@@ -2236,40 +2236,57 @@ impl SidText {
     }
 }
 
+/// Render a SID as `TdhFormatProperty` does: `0` when missing, `S-1-…` when valid,
+/// and the wire bytes in hex otherwise.
+fn fmt_sid(
+    f: &mut std::fmt::Formatter<'_>,
+    revision: u8,
+    authority: [u8; 6],
+    subs: impl Iterator<Item = u32> + Clone,
+    count: usize,
+    missing: bool,
+) -> std::fmt::Result {
+    if missing {
+        return f.write_str(MISSING_SID_TEXT);
+    }
+    // More than 255 sub-authorities has no wire form to dump, so it keeps the `S-`
+    // text below.
+    if !sid_is_valid(revision, count)
+        && let Ok(count) = u8::try_from(count)
+    {
+        let header = [revision, count].into_iter().chain(authority);
+        return write_sid_hex(f, header.chain(subs.flat_map(u32::to_le_bytes)));
+    }
+    let a = authority;
+    let authority_value = u64::from_be_bytes([0, 0, a[0], a[1], a[2], a[3], a[4], a[5]]);
+    let mut text = SidText::new();
+    if text
+        .push_sid(revision, authority_value, subs.clone())
+        .is_some()
+        && let Some(rendered) = text.as_str()
+    {
+        return f.write_str(rendered);
+    }
+
+    // A valid SID always fits the buffer; this keeps output correct regardless.
+    write_sid_prefix(f, revision, authority_value)?;
+    for sub in subs {
+        write!(f, "-{sub}")?;
+    }
+    Ok(())
+}
+
 impl std::fmt::Display for SidRef<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.is_missing() {
-            return f.write_str(MISSING_SID_TEXT);
-        }
-        if !self.is_valid() {
-            return write_sid_hex(f, self.0.iter().copied());
-        }
-        let auth = self.authority();
-        let authority_value =
-            u64::from_be_bytes([0, 0, auth[0], auth[1], auth[2], auth[3], auth[4], auth[5]]);
-
         let count = self.sub_authority_count() as usize;
-        let mut text = SidText::new();
-        if text
-            .push_sid(
-                self.revision(),
-                authority_value,
-                (0..count).filter_map(|i| self.sub_authority(i)),
-            )
-            .is_some()
-            && let Some(rendered) = text.as_str()
-        {
-            return f.write_str(rendered);
-        }
-
-        // A valid SID always fits the buffer; this keeps output correct regardless.
-        write_sid_prefix(f, self.revision(), authority_value)?;
-        for i in 0..count {
-            if let Some(sub) = self.sub_authority(i) {
-                write!(f, "-{sub}")?;
-            }
-        }
-        Ok(())
+        fmt_sid(
+            f,
+            self.revision(),
+            *self.authority(),
+            (0..count).filter_map(|i| self.sub_authority(i)),
+            count,
+            self.is_missing(),
+        )
     }
 }
 
@@ -2345,46 +2362,14 @@ impl Sid {
 
 impl std::fmt::Display for Sid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.is_missing() {
-            return f.write_str(MISSING_SID_TEXT);
-        }
-        // More than 255 sub-authorities has no wire form to dump, so it keeps the
-        // `S-` text below.
-        if !self.is_valid()
-            && let Ok(count) = u8::try_from(self.sub_authorities.len())
-        {
-            let header = [self.revision, count].into_iter().chain(self.authority);
-            let subs = self.sub_authorities.iter().flat_map(|s| s.to_le_bytes());
-            return write_sid_hex(f, header.chain(subs));
-        }
-        let authority_value = u64::from_be_bytes([
-            0,
-            0,
-            self.authority[0],
-            self.authority[1],
-            self.authority[2],
-            self.authority[3],
-            self.authority[4],
-            self.authority[5],
-        ]);
-        let mut text = SidText::new();
-        if text
-            .push_sid(
-                self.revision,
-                authority_value,
-                self.sub_authorities.iter().copied(),
-            )
-            .is_some()
-            && let Some(rendered) = text.as_str()
-        {
-            return f.write_str(rendered);
-        }
-
-        write_sid_prefix(f, self.revision, authority_value)?;
-        for sub in &self.sub_authorities {
-            write!(f, "-{sub}")?;
-        }
-        Ok(())
+        fmt_sid(
+            f,
+            self.revision,
+            self.authority,
+            self.sub_authorities.iter().copied(),
+            self.sub_authorities.len(),
+            self.missing,
+        )
     }
 }
 
@@ -2974,12 +2959,14 @@ mod tests {
     /// Build SID bytes. The count byte is the real count truncated to a byte, so
     /// over-long SIDs can be built for the invalid cases.
     fn make_sid(revision: u8, authority: u64, subs: &[u32]) -> Vec<u8> {
-        let mut bytes = vec![revision, subs.len() as u8];
-        bytes.extend_from_slice(&authority.to_be_bytes()[2..]);
-        for sub in subs {
-            bytes.extend_from_slice(&sub.to_le_bytes());
+        let mut v = Vec::new();
+        v.push(revision);
+        v.push(subs.len() as u8); // sub-authority count
+        v.extend_from_slice(&authority.to_be_bytes()[2..]); // 48-bit authority
+        for &sa in subs {
+            v.extend_from_slice(&sa.to_le_bytes());
         }
-        bytes
+        v
     }
 
     #[test]

@@ -448,23 +448,10 @@ impl std::fmt::Display for Property<'_> {
                 Ok(v) => write!(f, "{v}"),
                 Err(_) => write!(f, "<parse error>"),
             },
-            TdhInType::Sid => match SidRef::new(self.data) {
-                Some(sid) => write!(f, "{sid}"),
-                None => write!(f, "<parse error>"),
-            },
-            TdhInType::WbemSid => {
-                if let Some(missing) = missing_wbem_sid(self.data) {
-                    return write!(f, "{missing}");
-                }
-                // See token_user_size() for the pointer-size caveat.
-                let hdr = token_user_size(size_of::<usize>());
-                if self.data.len() > hdr {
-                    match SidRef::new(&self.data[hdr..]) {
-                        Some(sid) => write!(f, "{sid}"),
-                        None => write!(f, "<parse error>"),
-                    }
-                } else {
-                    write!(f, "<parse error>")
+            TdhInType::Sid | TdhInType::WbemSid => {
+                match SidRef::from_property_ref(self.data, self.in_type) {
+                    Ok(sid) => write!(f, "{sid}"),
+                    Err(_) => write!(f, "<parse error>"),
                 }
             }
             _ => {
@@ -2221,22 +2208,7 @@ const fn counted_string_len(data: &[u8], in_type: TdhInType) -> u16 {
 
 impl FromProperty for Sid {
     fn from_property(data: &[u8], in_type: TdhInType, _: TdhOutType) -> Result<Self> {
-        match in_type {
-            TdhInType::WbemSid => {
-                if let Some(missing) = missing_wbem_sid(data) {
-                    return Ok(missing.to_owned());
-                }
-                // Skip TOKEN_USER header to reach the SID.
-                // See token_user_size() for the pointer-size caveat.
-                let hdr = token_user_size(size_of::<usize>());
-                if data.len() <= hdr {
-                    return Err(Error::parse("Insufficient data for WbemSid"));
-                }
-                Self::from_property(&data[hdr..], TdhInType::Sid, TdhOutType::Null)
-            }
-            TdhInType::Sid => SidRef::parse(data).map(|sid| sid.to_owned()),
-            _ => Err(Error::parse(format!("Cannot parse Sid from {in_type:?}"))),
-        }
+        SidRef::from_property_ref(data, in_type).map(|sid| sid.to_owned())
     }
 }
 
@@ -2358,9 +2330,7 @@ impl<'a> FromPropertyRef<'a> for SidRef<'a> {
                 SidRef::parse(&data[hdr..])
             }
             TdhInType::Sid => SidRef::parse(data),
-            _ => Err(Error::parse(format!(
-                "Cannot borrow SidRef from {in_type:?} (expected Sid)"
-            ))),
+            _ => Err(Error::parse(format!("Cannot read a SID from {in_type:?}"))),
         }
     }
 }
@@ -2738,32 +2708,29 @@ mod tests {
 
     #[test]
     fn test_from_property_sid_reads_invalid_and_rejects_truncated() {
+        use super::position_tests::sid_bytes;
         let parse = |data: &[u8]| Sid::from_property(data, TdhInType::Sid, TdhOutType::Null);
-        let sid = |revision: u8, subs: &[u32]| {
-            let mut data = vec![revision, subs.len() as u8, 0, 0, 0, 0, 0, 5];
-            for sub in subs {
-                data.extend_from_slice(&sub.to_le_bytes());
-            }
-            data
-        };
 
         for revision in [0, 2, 255] {
-            let read = parse(&sid(revision, &[18])).expect("invalid SIDs still read");
+            let mut data = sid_bytes(1, &[18]);
+            data[0] = revision;
+            let read = parse(&data).expect("invalid SIDs still read");
             assert_eq!(read.revision(), revision);
             assert!(!read.is_valid());
         }
-        for count in [16, 255] {
-            let read = parse(&sid(1, &vec![1; count])).expect("invalid SIDs still read");
-            assert_eq!(read.sub_authorities().len(), count);
+        for count in [16u8, 255] {
+            let data = sid_bytes(count, &vec![1; count.into()]);
+            let read = parse(&data).expect("invalid SIDs still read");
+            assert_eq!(read.sub_authorities().len(), usize::from(count));
             assert!(!read.is_valid());
         }
 
-        let header = sid(1, &[]);
+        let header = sid_bytes(0, &[]);
         assert!(parse(&header).is_ok());
         assert!(parse(&header[..7]).is_err());
 
         // Claims two sub-authorities but holds one and a half.
-        let data = sid(1, &[21, 1000]);
+        let data = sid_bytes(2, &[21, 1000]);
         assert!(parse(&data[..data.len() - 2]).is_err());
     }
 
@@ -3647,7 +3614,7 @@ mod position_tests {
         v
     }
 
-    fn sid_bytes(sub_auth_count: u8, sub_auths: &[u32]) -> Vec<u8> {
+    pub(super) fn sid_bytes(sub_auth_count: u8, sub_auths: &[u32]) -> Vec<u8> {
         let mut v = Vec::new();
         v.push(1); // revision
         v.push(sub_auth_count);

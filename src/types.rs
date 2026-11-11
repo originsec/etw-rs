@@ -2853,23 +2853,35 @@ mod tests {
         assert_eq!(expected.len(), SID_TEXT_CAPACITY - 2);
     }
 
+    /// Build SID bytes. The count byte is the real count truncated to a byte, so
+    /// over-long SIDs can be built for the invalid cases.
+    fn make_sid(revision: u8, authority: u64, subs: &[u32]) -> Vec<u8> {
+        let mut bytes = vec![revision, subs.len() as u8];
+        bytes.extend_from_slice(&authority.to_be_bytes()[2..]);
+        for sub in subs {
+            bytes.extend_from_slice(&sub.to_le_bytes());
+        }
+        bytes
+    }
+
     #[test]
-    fn sid_display_authority_matches_convert_sid_to_string_sid() {
-        // Expected text is what ConvertSidToStringSidW returns for each authority
-        // (observed on Windows 11 26200): decimal up to u32::MAX, unpadded uppercase
-        // hex above it.
-        let cases: [([u8; 6], &str); 6] = [
-            ([0, 0, 0, 0, 0, 5], "5"),
-            ([0, 0, 0x80, 0, 0, 0], "2147483648"),
-            ([0, 0, 0xFF, 0xFF, 0xFF, 0xFF], "4294967295"),
-            ([0, 1, 0, 0, 0, 0], "0x100000000"),
-            ([0, 0x0A, 0xBC, 0xDE, 0xF0, 0x12], "0xABCDEF012"),
-            ([1, 0, 0, 0, 0, 0], "0x10000000000"),
+    fn sid_display_authority_pins_convert_sid_to_string_sid_format() {
+        // Decimal up to u32::MAX, then `0x` and unpadded uppercase hex — not the 12
+        // digits the 6-byte field suggests. Pinned here so Miri runs it too;
+        // `sid_display_matches_convert_sid_to_string_sid` checks Windows still agrees.
+        let cases: [(u64, &str); 9] = [
+            (5, "5"),
+            (0x8000_0000, "2147483648"),
+            (0xFFFF_FFFF, "4294967295"),
+            (0x1_0000_0000, "0x100000000"),
+            (0xA_0000_0000, "0xA00000000"),
+            (0xAB_CDEF_0123, "0xABCDEF0123"),
+            (0x100_0000_0000, "0x10000000000"),
+            (0xFFFF_0000_0000, "0xFFFF00000000"),
+            (0xFFFF_FFFF_FFFF, "0xFFFFFFFFFFFF"),
         ];
         for (authority, text) in cases {
-            let mut bytes = vec![1, 1];
-            bytes.extend_from_slice(&authority);
-            bytes.extend_from_slice(&18u32.to_le_bytes());
+            let bytes = make_sid(1, authority, &[18]);
             let expected = format!("S-1-{text}-18");
             let sid_ref = SidRef::new(&bytes).expect("valid SID");
             assert_eq!(sid_ref.to_string(), expected);
@@ -2877,7 +2889,7 @@ mod tests {
 
             let oversized = Sid {
                 revision: 1,
-                authority,
+                authority: *sid_ref.authority(),
                 sub_authorities: vec![7; 64],
             };
             assert_eq!(
@@ -2926,6 +2938,172 @@ mod tests {
         ];
         let sid = SidRef::new(&bytes).expect("valid SID");
         assert_eq!(format!("{sid:?}"), "SidRef(\"S-1-5-18\")");
+    }
+
+    #[test]
+    fn sid_ref_reads_an_unaligned_sid() {
+        // SIDs in an event payload are not necessarily 4-byte aligned.
+        let sid = make_sid(1, 5, &[21, 3_623_811_015, 3_361_044_348, 30_300_820, 1013]);
+        let mut buffer = vec![0xFF];
+        buffer.extend_from_slice(&sid);
+        let unaligned = &buffer[1..];
+        let expected = "S-1-5-21-3623811015-3361044348-30300820-1013";
+        assert_eq!(
+            SidRef::new(unaligned).expect("valid SID").to_string(),
+            expected
+        );
+        assert_eq!(
+            Sid::from_bytes(unaligned).expect("valid SID").to_string(),
+            expected
+        );
+    }
+
+    #[test]
+    fn sid_ref_rejects_malformed_sids() {
+        for revision in [0, 2, 255] {
+            assert!(
+                SidRef::new(&make_sid(revision, 5, &[18])).is_none(),
+                "revision {revision}"
+            );
+        }
+        assert!(SidRef::new(&make_sid(1, 5, &[1; 255])).is_none());
+
+        let header = make_sid(1, 5, &[]);
+        assert!(SidRef::new(&header).is_some());
+        assert!(SidRef::new(&header[..7]).is_none());
+
+        // Claims two sub-authorities but holds one and a half.
+        let sid = make_sid(1, 5, &[21, 1000]);
+        assert!(SidRef::new(&sid[..sid.len() - 2]).is_none());
+    }
+
+    /// `ConvertSidToStringSidW`'s text for `sid`, or `None` if it rejects it.
+    ///
+    /// `sid` must hold every sub-authority its count byte claims: Windows trusts it.
+    fn api_sid_string(sid: &[u8]) -> Option<String> {
+        use windows::Win32::{
+            Foundation::{HLOCAL, LocalFree},
+            Security::{Authorization::ConvertSidToStringSidW, PSID},
+        };
+        let mut text = windows::core::PWSTR::null();
+        // SAFETY: `sid` outlives the call and covers the length its count byte implies;
+        // on success `text` is a LocalAlloc'd NUL-terminated string, copied then freed.
+        unsafe {
+            ConvertSidToStringSidW(PSID(sid.as_ptr().cast_mut().cast()), &raw mut text).ok()?;
+            let rendered = text.to_string().ok();
+            let _ = LocalFree(Some(HLOCAL(text.0.cast())));
+            rendered
+        }
+    }
+
+    /// The bytes of the SID `ConvertStringSidToSidW` parses from `text`.
+    fn api_sid_bytes(text: &str) -> Vec<u8> {
+        use windows::Win32::{
+            Foundation::{HLOCAL, LocalFree},
+            Security::{Authorization::ConvertStringSidToSidW, GetLengthSid, PSID},
+        };
+        let mut psid = PSID(std::ptr::null_mut());
+        // SAFETY: on success `psid` is a LocalAlloc'd valid SID of `GetLengthSid` bytes,
+        // copied out before it is freed.
+        unsafe {
+            ConvertStringSidToSidW(&windows::core::HSTRING::from(text), &raw mut psid).expect(text);
+            let bytes =
+                std::slice::from_raw_parts(psid.0.cast::<u8>(), GetLengthSid(psid) as usize)
+                    .to_vec();
+            let _ = LocalFree(Some(HLOCAL(psid.0)));
+            bytes
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "calls ConvertSidToStringSidW (Win32)")]
+    fn sid_display_matches_convert_sid_to_string_sid() {
+        let mut sids: Vec<Vec<u8>> = [
+            "S-1-0-0",
+            "S-1-1-0",
+            "S-1-5-18",
+            "S-1-5-32-544",
+            "S-1-16-12288",
+            "S-1-5-21-3623811015-3361044348-30300820-1013",
+            "S-1-15-2-1430448594-2639229838-973813799-439329657-1197984847-4069167804-1277922394",
+        ]
+        .into_iter()
+        .map(api_sid_bytes)
+        .collect();
+
+        sids.push(make_sid(1, 5, &[]));
+        sids.push(make_sid(1, 5, &[u32::MAX; 15]));
+
+        // Every boundary where the number of decimal digits changes.
+        sids.push(make_sid(
+            1,
+            9,
+            &[0, 9, 10, 99, 100, 999, 1000, 9999, 10_000, 99_999, 100_000],
+        ));
+        sids.push(make_sid(
+            1,
+            10,
+            &[
+                999_999,
+                1_000_000,
+                9_999_999,
+                10_000_000,
+                99_999_999,
+                100_000_000,
+                999_999_999,
+                1_000_000_000,
+                u32::MAX,
+            ],
+        ));
+
+        for authority in [
+            0,
+            99,
+            100,
+            0xFFFF_FFFF,
+            0x1_0000_0000,
+            0xA_0000_0000,
+            0xAB_CDEF_0123,
+            0xFFFF_0000_0000,
+            0xFFFF_FFFF_FFFF,
+        ] {
+            sids.push(make_sid(1, authority, &[7]));
+        }
+
+        // The longest text a valid SID can produce.
+        sids.push(make_sid(1, 0xFFFF_FFFF_FFFF, &[u32::MAX; 15]));
+
+        for sid in &sids {
+            let expected = api_sid_string(sid).expect("Windows accepts every SID here");
+            let sid_ref = SidRef::new(sid).expect(&expected);
+            assert_eq!(sid_ref.to_string(), expected);
+            assert_eq!(sid_ref.to_owned().to_string(), expected);
+        }
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "calls ConvertSidToStringSidW (Win32)")]
+    fn sid_rejects_what_convert_sid_to_string_sid_rejects() {
+        let mut invalid: Vec<Vec<u8>> = [0, 2, 255]
+            .into_iter()
+            .map(|revision| make_sid(revision, 5, &[18]))
+            .collect();
+        invalid.push(make_sid(1, 5, &[1; 16]));
+        invalid.push(make_sid(1, 5, &[1; 255]));
+
+        for sid in &invalid {
+            assert_eq!(
+                api_sid_string(sid),
+                None,
+                "Windows accepted {:02x?}",
+                &sid[..8]
+            );
+            assert!(
+                SidRef::new(sid).is_none(),
+                "etw-rs accepted {:02x?}",
+                &sid[..8]
+            );
+        }
     }
 
     // =========================================================================

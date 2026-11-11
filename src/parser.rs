@@ -2799,6 +2799,32 @@ mod tests {
     }
 
     #[test]
+    fn test_from_property_sid_rejects_malformed() {
+        let parse = |data: &[u8]| Sid::from_property(data, TdhInType::Sid, TdhOutType::Null);
+        let sid = |revision: u8, subs: &[u32]| {
+            let mut data = vec![revision, subs.len() as u8, 0, 0, 0, 0, 0, 5];
+            for sub in subs {
+                data.extend_from_slice(&sub.to_le_bytes());
+            }
+            data
+        };
+
+        for revision in [0, 2, 255] {
+            assert!(parse(&sid(revision, &[18])).is_err(), "revision {revision}");
+        }
+        assert!(parse(&sid(1, &[1; 16])).is_err());
+        assert!(parse(&sid(1, &[1; 255])).is_err());
+
+        let header = sid(1, &[]);
+        assert!(parse(&header).is_ok());
+        assert!(parse(&header[..7]).is_err());
+
+        // Claims two sub-authorities but holds one and a half.
+        let data = sid(1, &[21, 1000]);
+        assert!(parse(&data[..data.len() - 2]).is_err());
+    }
+
+    #[test]
     fn test_from_property_binary() {
         let data = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE];
         let result = Vec::<u8>::from_property(&data, TdhInType::Binary, TdhOutType::Null)
@@ -4913,18 +4939,19 @@ mod position_tests {
             0x12, 0x00, 0x00, 0x00, // SubAuthority[0] = 18
         ];
         let s = display_prop(TdhInType::Sid, TdhOutType::Null, &sid);
-        assert!(s.contains("S-1-"), "expected SID format, got: {s}");
+        assert_eq!(s, "S-1-5-18");
     }
 
     #[test]
     fn property_display_in_type_wbem_sid() {
-        // TOKEN_USER header (16 bytes on 64-bit) + S-1-5-18 SID (12 bytes)
-        let mut bytes = [0u8; 28];
+        // TOKEN_USER header (16 bytes on 64-bit) + S-1-5-18 SID (12 bytes). The header
+        // must not be zero: TDH reads a zero `TOKEN_USER.Sid` as a 4-byte "no SID".
+        let mut bytes = [0xFFu8; 28];
         bytes[16..].copy_from_slice(&[
             0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x12, 0x00, 0x00, 0x00,
         ]);
         let s = display_prop(TdhInType::WbemSid, TdhOutType::Null, &bytes);
-        assert!(s.contains("S-1-"), "expected SID format, got: {s}");
+        assert_eq!(s, "S-1-5-18");
     }
 
     #[test]

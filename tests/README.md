@@ -31,7 +31,7 @@ prints are **not** visible in a default run — libtest captures the stdout of
 passing tests — so add `--nocapture` to see which operations were skipped.
 
 The suites that need no privilege (`static_schema_*`, `validate_*`,
-`differential_offline`, `differential_filetime`) do not include `common/mod.rs`
+`differential_offline`, `differential_wbemsid`, `differential_filetime`) do not include `common/mod.rs`
 and pass without the variable.
 
 The guard probes **enabling a kernel provider**, because that is the narrowest
@@ -186,8 +186,9 @@ rationale in the module docs of `tests/common/differential.rs`.
 
 | File | What It Tests | Admin? |
 |------|---------------|--------|
-| `differential_offline.rs` | Every manifest-expressible TDH in-type except the three counted types (Unicode string, ANSI string, binary), in seven shapes across three axes (offset, multiplicity, container), plus linkage shapes and zero-length edge cases. Asserts byte-for-byte agreement with TDH on every property, array element and struct member. | No |
+| `differential_offline.rs` | Every manifest-expressible TDH in-type except the three counted types (Unicode string, ANSI string, binary), in seven shapes across three axes (offset, multiplicity, container), plus linkage shapes and zero-length edge cases. Asserts byte-for-byte agreement with TDH on every property, array element and struct member, and that SID properties — valid and invalid — display exactly as `TdhFormatProperty` renders them. | No |
 | `differential_tracelogging.rs` | The TraceLogging decode path, including `TDH_INTYPE_COUNTEDSTRING`, which manifests cannot express. Payloads are encoded by `tracelogging_dynamic` (Microsoft's own encoder), so the value handed to the encoder is ground truth by construction. | Yes |
+| `differential_wbemsid.rs` | `TDH_INTYPE_WBEMSID`, which manifests cannot express, on the kernel's classic Process/Start v3 class that TDH resolves from WMI: TOKEN_USER plus SID, invalid SIDs behind it, and the 4-byte no-SID form. Byte-for-byte against TDH, plus the intended values of `UserSID` and the strings after it. | No |
 | `differential_filetime.rs` | `Timestamp`'s pure-Rust calendar arithmetic against `FileTimeToSystemTime`. The accept/reject boundary is found by bisection rather than taken from the documentation, since the raw-`i64` fallback must trigger on exactly the inputs Win32 refuses. Then every day from 1601 to 2600 — a leap day either side of every century boundary in range — and 100k fixed-seed pseudorandom values. | No |
 
 Three mechanisms make a wrong answer hard to hide in the TDH suites:
@@ -280,9 +281,10 @@ data, or live TDH metadata without a session.
 > - **etw-rs's own behaviour** — hint fallback, cache paths, `Display` output;
 > - **fixed-width value conversion** — `[0xFE] → -2i8` is self-evident from the
 >   spec, and moving it elsewhere would not make it stronger;
-> - **types no oracle can reach** — `WbemSid` and `ReversedCountedString`, which
->   are MOF-only. Weakest tests in the tree; captured classic-kernel events are
->   what would fix them.
+> - **types no oracle can reach** — `ReversedCountedString`, which is MOF-only and
+>   in no MOF class TDH can resolve offline. Weakest tests in the tree; captured
+>   classic events are what would fix them. (`WbemSid` is reached through the
+>   kernel Process class in `differential_wbemsid.rs`.)
 >
 > Before deleting a synthetic offset test as redundant, check the shape is
 > actually covered by the differential fixtures — `shape_records()`, `edge_records()` and `linkage_records()`.

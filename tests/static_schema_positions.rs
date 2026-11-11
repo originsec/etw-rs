@@ -677,7 +677,7 @@ fn counted_types_at_various_positions() -> etw::Result<()> {
 fn wbem_sid_sized_rejects_undersize() {
     // size_bytes < 16 (WBEM_SID_TOKEN_USER_SIZE) should return an error,
     // not panic from an out-of-bounds slice.
-    let data = [0u8; 32];
+    let data = [0xFFu8; 32];
     let result = etw::static_schema::parse_wbem_sid_sized(&data, 0, 8);
     assert!(result.is_err());
     let msg = result.unwrap_err().to_string();
@@ -699,20 +699,17 @@ fn counted_wide_string_rejects_odd_byte_count() {
 }
 
 #[test]
-fn sid_rejects_invalid_revision() {
-    // SID with revision 0 should be rejected by SidRef::new().
+fn sid_reads_invalid_revision_as_invalid() {
+    // A revision-0 SID is invalid, but still read and skipped as TDH sizes it.
     let mut data = [0u8; 12]; // 8-byte header + 4-byte sub-authority
     data[0] = 0; // Invalid revision (should be 1)
     data[1] = 1; // SubAuthorityCount = 1
-    assert!(etw::SidRef::new(&data).is_none());
+    assert!(!etw::SidRef::new(&data).unwrap().is_valid());
 
-    // Also rejected by parse_following_sid.
-    let result = etw::static_schema::parse_following_sid(&data, 0);
-    assert!(result.is_err());
-    let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("revision"), "unexpected error: {msg}");
+    let sid = etw::static_schema::parse_following_sid(&data, 0).unwrap();
+    assert!(!sid.is_valid());
+    assert_eq!(sid.as_bytes().len(), 12);
 
-    // But still skipped, as TDH sizes it: by count, not validity.
     assert_eq!(etw::static_schema::scan_past_sid(&data, 0).ok(), Some(12));
 }
 
@@ -728,9 +725,9 @@ fn sid_accepts_valid_revision() {
 }
 
 #[test]
-fn wbem_sid_rejects_invalid_revision() {
+fn wbem_sid_reads_invalid_revision_as_invalid() {
     // Build a WbemSid buffer: 16-byte TOKEN_USER header + SID with invalid revision.
-    let mut data = [0u8; 28]; // 16 (TOKEN_USER) + 12 (SID header + 1 sub-authority)
+    let mut data = [0xFFu8; 28]; // 16 (TOKEN_USER) + 12 (SID header + 1 sub-authority)
     // SID starts at offset 16. Set revision to 0 (invalid) and sub_authority_count to 1.
     data[16] = 0; // Invalid revision (should be 1)
     data[17] = 1; // SubAuthorityCount = 1
@@ -741,8 +738,7 @@ fn wbem_sid_rejects_invalid_revision() {
         Some(28)
     );
 
-    let result = etw::static_schema::parse_wbem_sid(&data, 0);
-    assert!(result.is_err());
-    let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("revision"), "unexpected error: {msg}");
+    let sid = etw::static_schema::parse_wbem_sid(&data, 0).unwrap();
+    assert!(!sid.is_valid());
+    assert_eq!(sid.revision(), 0);
 }

@@ -410,6 +410,9 @@ pub enum TdhInType {
     /// fixed offset — the prefix must be sized from the event header flags before the
     /// sub-authority count can be read.
     ///
+    /// A field whose first four bytes are zero carries no SID and is 4 bytes long, as TDH sizes
+    /// it; see [`SidRef::is_missing`].
+    ///
     /// Deprecated by the SDK in favour of [`Self::Sid`].
     WbemSid,
     /// Synthetic marker for struct properties.
@@ -1955,6 +1958,11 @@ impl std::fmt::Display for Guid {
 /// This is a zero-copy wrapper around raw SID bytes that provides
 /// access to both the raw bytes and string conversion.
 ///
+/// It holds whatever SID an event carries, valid or not: any revision and up to 255
+/// sub-authorities, sized as TDH sizes them. [`SidRef::is_valid`] says whether
+/// Windows would accept it, and `Display` follows `TdhFormatProperty` — `S-1-…`
+/// for a valid SID, `0x` and the bytes in hex otherwise.
+///
 /// # Example
 ///
 /// ```no_run
@@ -1970,16 +1978,16 @@ impl std::fmt::Display for Guid {
 pub struct SidRef<'a>(&'a [u8]);
 
 impl<'a> SidRef<'a> {
-    /// Wrap raw SID bytes.
+    /// Wrap raw SID bytes, trimmed to `8 + 4 * SubAuthorityCount`.
     ///
-    /// Returns `None` if the bytes are too short to contain a valid SID header
-    /// or the revision is not 1 (the only valid SID revision defined by Windows).
+    /// Returns `None` only if `data` is too short for that; an invalid SID is
+    /// wrapped, and [`SidRef::is_valid`] reports it.
     #[must_use]
     pub fn new(data: &'a [u8]) -> Option<Self> {
         Self::parse(data).ok()
     }
 
-    /// [`SidRef::new`], with an error saying which check failed.
+    /// [`SidRef::new`], with an error saying how much data was missing.
     pub(crate) fn parse(data: &'a [u8]) -> Result<Self> {
         if data.len() < 8 {
             return Err(Error::parse(format!(
@@ -1987,20 +1995,7 @@ impl<'a> SidRef<'a> {
                 data.len()
             )));
         }
-        let revision = data[0];
-        // SID_REVISION (1) is the only valid revision per the Windows SDK.
-        if revision != 1 {
-            return Err(Error::parse(format!(
-                "Invalid SID revision {revision} (expected 1)"
-            )));
-        }
         let sub_auth_count = data[1] as usize;
-        // SID_MAX_SUB_AUTHORITIES = 15 per the Windows SDK.
-        if sub_auth_count > 15 {
-            return Err(Error::parse(format!(
-                "SID sub-authority count {sub_auth_count} exceeds maximum of 15"
-            )));
-        }
         let expected_len = 8 + sub_auth_count * 4;
         if data.len() < expected_len {
             return Err(Error::parse(format!(
@@ -2011,7 +2006,34 @@ impl<'a> SidRef<'a> {
         Ok(Self(&data[..expected_len]))
     }
 
+    /// A `WbemSid`'s [missing](Self::is_missing) SID: the four zero bytes it carries
+    /// instead. It displays as `0`, as `TdhFormatProperty` renders it.
+    pub(crate) const fn missing(bytes: &'a [u8; 4]) -> Self {
+        Self(bytes)
+    }
+
+    /// Whether this is a `WbemSid`'s missing SID — four zero bytes standing in for
+    /// the SID — rather than a SID read from the event. Not to be confused with the
+    /// well-known NULL SID, `S-1-0-0`. A missing SID is not [valid](Self::is_valid).
+    ///
+    /// The kernel writes it when allocating for the SID query fails.
+    #[must_use]
+    pub const fn is_missing(&self) -> bool {
+        // `new` never wraps fewer than the 8-byte header.
+        self.0.len() < 8
+    }
+
+    /// Whether Windows would accept this SID, as `IsValidSid` judges: revision 1
+    /// (`SID_REVISION`) and at most 15 sub-authorities (`SID_MAX_SUB_AUTHORITIES`).
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        sid_is_valid(self.revision(), self.sub_authority_count() as usize)
+    }
+
     /// Returns the raw SID bytes.
+    ///
+    /// A [missing](Self::is_missing) SID returns its four zero bytes, which are not
+    /// a SID: check before passing them to a Win32 SID API.
     #[must_use]
     pub const fn as_bytes(&self) -> &'a [u8] {
         self.0
@@ -2029,13 +2051,14 @@ impl<'a> SidRef<'a> {
         self.0[1]
     }
 
-    /// Returns the identifier authority (6 bytes).
+    /// Returns the identifier authority (6 bytes), all zero for a
+    /// [missing](Self::is_missing) SID.
     #[must_use]
     pub fn authority(&self) -> &[u8; 6] {
-        #[expect(clippy::expect_used, reason = "infallible: SidRef guarantees ≥8 bytes")]
-        self.0[2..8]
-            .try_into()
-            .expect("SidRef guarantees at least 8 bytes")
+        self.0
+            .get(2..8)
+            .and_then(|a| a.try_into().ok())
+            .unwrap_or(&[0; 6])
     }
 
     /// Returns the sub-authority at the given index.
@@ -2075,7 +2098,28 @@ impl<'a> SidRef<'a> {
     }
 }
 
-/// Longest text a SID accepted by [`SidRef::new`] can render to.
+/// How `TdhFormatProperty` renders a `WbemSid` that carries no SID.
+const MISSING_SID_TEXT: &str = "0";
+
+/// `IsValidSid`'s rule: `SID_REVISION` (1) and at most `SID_MAX_SUB_AUTHORITIES` (15).
+const fn sid_is_valid(revision: u8, sub_authority_count: usize) -> bool {
+    revision == 1 && sub_authority_count <= 15
+}
+
+/// Write `bytes` as `TdhFormatProperty` renders a SID it cannot validate: `0x` and
+/// the bytes in uppercase hex.
+fn write_sid_hex(
+    f: &mut std::fmt::Formatter<'_>,
+    bytes: impl IntoIterator<Item = u8>,
+) -> std::fmt::Result {
+    f.write_str("0x")?;
+    for b in bytes {
+        write!(f, "{b:02X}")?;
+    }
+    Ok(())
+}
+
+/// Longest text a valid SID can render to.
 ///
 /// `"S-"`, a revision of up to 3 digits, `"-"`, a 48-bit authority (at widest `"0x"`
 /// and 12 hex digits), and the SID maximum of 15 sub-authorities, each a `"-"` and up
@@ -2193,6 +2237,12 @@ impl SidText {
 
 impl std::fmt::Display for SidRef<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_missing() {
+            return f.write_str(MISSING_SID_TEXT);
+        }
+        if !self.is_valid() {
+            return write_sid_hex(f, self.0.iter().copied());
+        }
         let auth = self.authority();
         let authority_value =
             u64::from_be_bytes([0, 0, auth[0], auth[1], auth[2], auth[3], auth[4], auth[5]]);
@@ -2211,8 +2261,7 @@ impl std::fmt::Display for SidRef<'_> {
             return f.write_str(rendered);
         }
 
-        // `SidRef::new` bounds both the revision and the sub-authority count, so the
-        // buffer always suffices in practice; this keeps output correct regardless.
+        // A valid SID always fits the buffer; this keeps output correct regardless.
         write_sid_prefix(f, self.revision(), authority_value)?;
         for i in 0..count {
             if let Some(sub) = self.sub_authority(i) {
@@ -2230,9 +2279,12 @@ impl std::fmt::Debug for SidRef<'_> {
 }
 
 /// An owned Security Identifier (SID).
+///
+/// Like [`SidRef`], it may hold an invalid SID; [`Sid::is_valid`] says whether
+/// Windows would accept it, and `Display` renders an invalid one in hex.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Sid {
-    /// SID revision level (always 1).
+    /// SID revision level. 1 is the only valid revision.
     pub revision: u8,
     /// 48-bit identifier authority value.
     pub authority: [u8; 6],
@@ -2243,15 +2295,43 @@ pub struct Sid {
 impl Sid {
     /// Parse a SID from raw bytes.
     ///
-    /// Returns `None` if the bytes are too short or malformed.
+    /// Returns `None` only if the bytes are too short for the SID they describe.
     #[must_use]
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         SidRef::new(data).map(|r| r.to_owned())
+    }
+
+    /// Whether Windows would accept this SID; see [`SidRef::is_valid`].
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        sid_is_valid(self.revision, self.sub_authorities.len())
+    }
+
+    /// Whether this is a `WbemSid`'s missing SID; see [`SidRef::is_missing`].
+    ///
+    /// A missing SID converts to revision 0, a zero authority and no
+    /// sub-authorities, so an all-zero 8-byte SID — which no emitter writes — reads
+    /// as missing too.
+    #[must_use]
+    pub fn is_missing(&self) -> bool {
+        self.revision == 0 && self.authority == [0; 6] && self.sub_authorities.is_empty()
     }
 }
 
 impl std::fmt::Display for Sid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_missing() {
+            return f.write_str(MISSING_SID_TEXT);
+        }
+        // More than 255 sub-authorities has no wire form to dump, so it keeps the
+        // `S-` text below.
+        if !self.is_valid()
+            && let Ok(count) = u8::try_from(self.sub_authorities.len())
+        {
+            let header = [self.revision, count].into_iter().chain(self.authority);
+            let subs = self.sub_authorities.iter().flat_map(|s| s.to_le_bytes());
+            return write_sid_hex(f, header.chain(subs));
+        }
         let authority_value = u64::from_be_bytes([
             0,
             0,
@@ -2275,9 +2355,6 @@ impl std::fmt::Display for Sid {
             return f.write_str(rendered);
         }
 
-        // The fields are public, so a `Sid` may hold more sub-authorities or a wider
-        // revision than the SID specification allows. Those still format correctly,
-        // just without the fast path.
         write_sid_prefix(f, self.revision, authority_value)?;
         for sub in &self.sub_authorities {
             write!(f, "-{sub}")?;
@@ -2834,12 +2911,15 @@ mod tests {
     }
 
     #[test]
-    fn sid_ref_rejects_excessive_sub_auth_count() {
-        // Sub-authority count > 15 (SID_MAX_SUB_AUTHORITIES) should be rejected.
+    fn sid_ref_holds_excessive_sub_auth_count_as_invalid() {
+        // Past SID_MAX_SUB_AUTHORITIES (15) the SID is invalid but still readable.
         let mut bytes = [0u8; 8 + 16 * 4]; // enough space for 16 sub-auths
         bytes[0] = 0x01; // revision
         bytes[1] = 16; // sub_auth_count = 16 (exceeds max of 15)
-        assert!(SidRef::new(&bytes).is_none());
+        let sid = SidRef::new(&bytes).expect("sized SID");
+        assert!(!sid.is_valid());
+        assert_eq!(sid.sub_authority_count(), 16);
+        assert_eq!(sid.sub_authority(15), Some(0));
     }
 
     #[test]
@@ -2904,14 +2984,15 @@ mod tests {
             assert_eq!(sid_ref.to_string(), expected);
             assert_eq!(sid_ref.to_owned().to_string(), expected);
 
+            // Too many sub-authorities for a wire form, so rendered as text.
             let oversized = Sid {
                 revision: 1,
                 authority: *sid_ref.authority(),
-                sub_authorities: vec![7; 64],
+                sub_authorities: vec![7; 256],
             };
             assert_eq!(
                 oversized.to_string(),
-                format!("S-1-{text}{}", "-7".repeat(64)),
+                format!("S-1-{text}{}", "-7".repeat(256)),
                 "fallback path"
             );
         }
@@ -2919,15 +3000,57 @@ mod tests {
 
     #[test]
     fn sid_owned_display_falls_back_past_buffer() {
-        // `Sid` has public fields, so it can hold more sub-authorities than the SID
-        // specification allows and overflow the fast path. Output must stay correct.
+        // `Sid` has public fields, so it can hold more sub-authorities than any wire
+        // form (255) and overflow the fast path. Output must stay correct.
         let sid = Sid {
             revision: 1,
             authority: [0, 0, 0, 0, 0, 5],
-            sub_authorities: vec![7; 64],
+            sub_authorities: vec![7; 256],
         };
-        let expected = format!("S-1-5{}", "-7".repeat(64));
+        let expected = format!("S-1-5{}", "-7".repeat(256));
         assert_eq!(format!("{sid}"), expected);
+    }
+
+    #[test]
+    fn missing_sid_reads_as_zeros_and_displays_as_0() {
+        let sid = SidRef::missing(&[0; 4]);
+        assert!(sid.is_missing());
+        assert!(!sid.is_valid());
+        assert_eq!((sid.revision(), sid.sub_authority_count()), (0, 0));
+        assert_eq!(sid.authority(), &[0; 6]);
+        assert_eq!(sid.sub_authority(0), None);
+        assert_eq!(sid.to_string(), "0");
+
+        let owned = sid.to_owned();
+        assert!(owned.is_missing());
+        assert!(!owned.is_valid());
+        assert_eq!(owned.to_string(), "0");
+
+        // A real SID is never missing, valid or not.
+        let header = make_sid(0, 0, &[]);
+        assert!(!SidRef::new(&header).expect("sized SID").is_missing());
+        assert!(
+            !SidRef::new(&make_sid(1, 5, &[18]))
+                .expect("sized SID")
+                .is_missing()
+        );
+    }
+
+    #[test]
+    fn sid_display_invalid_is_hex_like_tdh_format_property() {
+        // Revision 0 is the text TdhFormatProperty gives these bytes.
+        let revision_0 = make_sid(0, 5, &[18]);
+        let sid = SidRef::new(&revision_0).expect("sized SID");
+        assert!(!sid.is_valid());
+        assert_eq!(sid.to_string(), "0x000100000000000512000000");
+        assert_eq!(sid.to_owned().to_string(), "0x000100000000000512000000");
+
+        let count_16 = make_sid(1, 5, &[1; 16]);
+        let expected = format!("0x0110000000000005{}", "01000000".repeat(16));
+        let sid = SidRef::new(&count_16).expect("sized SID");
+        assert_eq!(sid.to_string(), expected);
+        assert_eq!(sid.to_owned().to_string(), expected);
+        assert_eq!(format!("{sid:?}"), format!("SidRef(\"{expected}\")"));
     }
 
     #[test]
@@ -2976,14 +3099,17 @@ mod tests {
     }
 
     #[test]
-    fn sid_ref_rejects_malformed_sids() {
+    fn sid_ref_holds_invalid_sids_and_rejects_truncated_ones() {
         for revision in [0, 2, 255] {
-            assert!(
-                SidRef::new(&make_sid(revision, 5, &[18])).is_none(),
-                "revision {revision}"
-            );
+            let sid = make_sid(revision, 5, &[18]);
+            let sid = SidRef::new(&sid).expect("sized SID");
+            assert!(!sid.is_valid(), "revision {revision}");
+            assert_eq!(sid.revision(), revision);
         }
-        assert!(SidRef::new(&make_sid(1, 5, &[1; 255])).is_none());
+        let max = make_sid(1, 5, &[1; 255]);
+        let sid = SidRef::new(&max).expect("sized SID");
+        assert!(!sid.is_valid());
+        assert_eq!(sid.as_bytes().len(), 8 + 255 * 4);
 
         let header = make_sid(1, 5, &[]);
         assert!(SidRef::new(&header).is_some());
@@ -3099,27 +3225,27 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "calls ConvertSidToStringSidW (Win32)")]
-    fn sid_rejects_what_convert_sid_to_string_sid_rejects() {
-        let mut invalid: Vec<Vec<u8>> = [0, 2, 255]
+    #[cfg_attr(miri, ignore = "calls IsValidSid (Win32)")]
+    fn sid_is_valid_matches_is_valid_sid() {
+        use windows::Win32::Security::{IsValidSid, PSID};
+
+        let mut sids: Vec<Vec<u8>> = [0, 1, 2, 255]
             .into_iter()
             .map(|revision| make_sid(revision, 5, &[18]))
             .collect();
-        invalid.push(make_sid(1, 5, &[1; 16]));
-        invalid.push(make_sid(1, 5, &[1; 255]));
+        for count in [0, 15, 16, 255] {
+            sids.push(make_sid(1, 5, &vec![1; count]));
+        }
 
-        for sid in &invalid {
-            assert_eq!(
-                api_sid_string(sid),
-                None,
-                "Windows accepted {:02x?}",
-                &sid[..8]
-            );
-            assert!(
-                SidRef::new(sid).is_none(),
-                "etw-rs accepted {:02x?}",
-                &sid[..8]
-            );
+        for sid in &sids {
+            // SAFETY: `sid` outlives the call and holds every sub-authority its count
+            // byte claims, which is all IsValidSid reads.
+            let windows = unsafe { IsValidSid(PSID(sid.as_ptr().cast_mut().cast())) }.as_bool();
+            let ours = SidRef::new(sid).expect("sized SID");
+            assert_eq!(ours.is_valid(), windows, "{:02x?}", &sid[..8]);
+            assert_eq!(ours.to_owned().is_valid(), windows, "{:02x?}", &sid[..8]);
+            // ConvertSidToStringSidW refuses exactly the SIDs IsValidSid rejects.
+            assert_eq!(api_sid_string(sid).is_some(), windows, "{:02x?}", &sid[..8]);
         }
     }
 

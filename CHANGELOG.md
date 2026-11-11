@@ -14,12 +14,16 @@
 
 - **Breaking:** static wide-string accessors return `OsString`.
 - **Breaking:** `get::<String>()` decodes wide strings lossily.
+- **Breaking:** an invalid SID is read rather than rejected. `is_valid()` reports
+  it, and it displays as hex, as `TdhFormatProperty` does.
 - SID authorities above `u32::MAX` display in hex, as Windows does.
 
 ### Fixed
 
 - ANSI strings decode as UTF-8 when their out-type is `Utf8`, `Json` or `Xml`.
-- An invalid SID no longer misplaces the properties after it.
+- An invalid SID, or a `WbemSid` carrying no SID, no longer misplaces the
+  properties after it. The latter reads as missing (`is_missing()`) and displays
+  as `0`.
 - `array_elements()` returns an error instead of panicking on a truncated SID.
 
 ## [0.1.0] - 2026-10-23

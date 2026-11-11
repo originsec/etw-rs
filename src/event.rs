@@ -700,8 +700,9 @@ impl RawEvent {
     ///
     /// # Errors
     ///
-    /// Returns [`NotPresent`](crate::Error::NotPresent) if the SID extended data is absent,
-    /// or [`ParseError`](crate::Error::ParseError) if the SID is malformed.
+    /// Returns [`NotPresent`](crate::Error::NotPresent) if the SID extended data is absent
+    /// or truncated. An invalid SID is returned; [`SidRef::is_valid`](crate::SidRef::is_valid)
+    /// reports it.
     ///
     /// # Example
     ///

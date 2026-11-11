@@ -41,8 +41,8 @@ mod differential;
 
 use differential::{
     ERROR_INVALID_PARAMETER, LEAD, Regime, SENTINEL, TestRecord, ansiz, compare_event_with_tdh,
-    load_fixture_manifest, payload, sid, tdh_property_bytes, tdh_property_bytes_at,
-    tdh_struct_member_bytes, utf16z, with_sentinel,
+    load_fixture_manifest, payload, sid, tdh_format_property, tdh_property_bytes,
+    tdh_property_bytes_at, tdh_struct_member_bytes, utf16z, with_sentinel,
 };
 use etw::{TdhInType, processing_context::ProcessingContext};
 
@@ -777,6 +777,56 @@ fn zero_length_properties_are_empty_not_missing() {
         checked,
         zero_length.len(),
         "every zero-length fixture should have been checked"
+    );
+}
+
+/// A SID property displays as `TdhFormatProperty` renders it: `S-1-…` when valid,
+/// `0x` and the bytes in hex when not.
+#[test]
+fn sid_display_agrees_with_tdh_format_property() {
+    load_fixture_manifest();
+
+    let mut problems = Vec::new();
+    let mut checked = 0usize;
+    for f in all_records() {
+        let scalar = !matches!(
+            f.shape,
+            Some(Shape::ArrayFixed | Shape::ArrayParamCount | Shape::StructMember)
+        );
+        if !f.label.starts_with("Sid") || !scalar {
+            continue;
+        }
+        let mut ctx = ProcessingContext::new();
+        let mut parser = ctx
+            .parser(f.record.as_raw_event())
+            .unwrap_or_else(|e| panic!("{}: parser construction failed: {e}", f.label));
+        let props = parser
+            .named_properties()
+            .unwrap_or_else(|e| panic!("{}: named_properties failed: {e}", f.label));
+        let (_, subject) = props
+            .iter()
+            .find(|(name, _)| name == "Subject")
+            .unwrap_or_else(|| panic!("{}: no Subject property", f.label));
+        let ours = subject.to_string();
+        match tdh_format_property(f.record.as_raw_event(), "Subject") {
+            Ok(tdh) if tdh == ours => checked += 1,
+            Ok(tdh) => problems.push(format!("{}: etw-rs {ours:?} != TDH {tdh:?}", f.label)),
+            Err(status) => problems.push(format!(
+                "{}: TdhFormatProperty failed (Win32 {status})",
+                f.label
+            )),
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "SID display disagrees with TdhFormatProperty:\n{}",
+        problems.join("\n")
+    );
+    // The four scalar shapes, the empty SID, and the four invalid SIDs.
+    assert_eq!(
+        checked, 9,
+        "expected every scalar SID fixture to be compared"
     );
 }
 

@@ -55,7 +55,7 @@ use crate::{
     Error, Result,
     event::Timestamp,
     processing_context::EventSchema,
-    static_schema::compute_sid_size,
+    static_schema::{compute_sid_size, missing_wbem_sid, wbem_sid_size},
     types::{
         AnsiStrRef, AnsiString, Guid, Sid, SidRef, SystemTime, TdhInType, TdhOutType, WideStrRef,
     },
@@ -453,6 +453,9 @@ impl std::fmt::Display for Property<'_> {
                 None => write!(f, "<parse error>"),
             },
             TdhInType::WbemSid => {
+                if let Some(missing) = missing_wbem_sid(self.data) {
+                    return write!(f, "{missing}");
+                }
                 // See token_user_size() for the pointer-size caveat.
                 let hdr = token_user_size(size_of::<usize>());
                 if self.data.len() > hdr {
@@ -1474,10 +1477,7 @@ impl<'a> EventParser<'a> {
                 }
                 Ok(total)
             }
-            TdhInType::WbemSid => {
-                let hdr = token_user_size(pointer_size);
-                Ok(hdr + compute_sid_size(remaining, hdr)?)
-            }
+            TdhInType::WbemSid => wbem_sid_size(remaining, 0, token_user_size(pointer_size)),
             _ => Err(Error::parse(format!(
                 "Cannot determine size for type {in_type:?}"
             ))),
@@ -2223,6 +2223,9 @@ impl FromProperty for Sid {
     fn from_property(data: &[u8], in_type: TdhInType, _: TdhOutType) -> Result<Self> {
         match in_type {
             TdhInType::WbemSid => {
+                if let Some(missing) = missing_wbem_sid(data) {
+                    return Ok(missing.to_owned());
+                }
                 // Skip TOKEN_USER header to reach the SID.
                 // See token_user_size() for the pointer-size caveat.
                 let hdr = token_user_size(size_of::<usize>());
@@ -2345,6 +2348,9 @@ impl<'a> FromPropertyRef<'a> for SidRef<'a> {
                 // etw-rs requires a 64-bit host, so pointer_size is unavailable
                 // here; we assume 64-bit (16 bytes). 32-bit (WOW64) emitters
                 // would produce an 8-byte header and are not handled by this trait.
+                if let Some(missing) = missing_wbem_sid(data) {
+                    return Ok(missing);
+                }
                 let hdr = token_user_size(size_of::<usize>());
                 if data.len() <= hdr {
                     return Err(Error::parse("Insufficient data for WbemSid"));
@@ -2731,7 +2737,7 @@ mod tests {
     }
 
     #[test]
-    fn test_from_property_sid_rejects_malformed() {
+    fn test_from_property_sid_reads_invalid_and_rejects_truncated() {
         let parse = |data: &[u8]| Sid::from_property(data, TdhInType::Sid, TdhOutType::Null);
         let sid = |revision: u8, subs: &[u32]| {
             let mut data = vec![revision, subs.len() as u8, 0, 0, 0, 0, 0, 5];
@@ -2742,10 +2748,15 @@ mod tests {
         };
 
         for revision in [0, 2, 255] {
-            assert!(parse(&sid(revision, &[18])).is_err(), "revision {revision}");
+            let read = parse(&sid(revision, &[18])).expect("invalid SIDs still read");
+            assert_eq!(read.revision, revision);
+            assert!(!read.is_valid());
         }
-        assert!(parse(&sid(1, &[1; 16])).is_err());
-        assert!(parse(&sid(1, &[1; 255])).is_err());
+        for count in [16, 255] {
+            let read = parse(&sid(1, &vec![1; count])).expect("invalid SIDs still read");
+            assert_eq!(read.sub_authorities.len(), count);
+            assert!(!read.is_valid());
+        }
 
         let header = sid(1, &[]);
         assert!(parse(&header).is_ok());
@@ -3430,8 +3441,23 @@ mod tests {
     #[test]
     fn test_variable_size_wbem_sid_too_short() {
         // hdr is 16 (64-bit pointer_size). Need hdr + 8 = 24 bytes minimum.
-        let data = [0u8; 20];
+        let data = [0xFFu8; 20];
         let r = EventParser::compute_variable_element_size(&data, TdhInType::WbemSid, 8);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_variable_size_wbem_sid_null_is_four_bytes() {
+        // A zero first u32 is the kernel's no-SID form, whatever follows.
+        for data in [
+            [0u8; 4].to_vec(),
+            [0u8; 28].to_vec(),
+            [0, 0, 0, 0, 0xFF, 0xFF].to_vec(),
+        ] {
+            let size = EventParser::compute_variable_element_size(&data, TdhInType::WbemSid, 8);
+            assert_eq!(size.ok(), Some(4), "{data:02x?}");
+        }
+        let r = EventParser::compute_variable_element_size(&[0u8; 3], TdhInType::WbemSid, 8);
         assert!(r.is_err());
     }
 
@@ -3462,7 +3488,7 @@ mod tests {
     #[test]
     fn test_variable_size_wbem_sid_valid() {
         // 16-byte header + 12-byte SID (1 sub-auth)
-        let mut data = vec![0u8; 28];
+        let mut data = vec![0xFFu8; 28];
         data[16] = 0x01; // revision
         data[17] = 0x01; // sub_auth_count = 1
         let size =
@@ -3812,8 +3838,8 @@ mod position_tests {
             .build_with_cache();
 
         let mut data = Vec::new();
-        // TOKEN_USER header: 16 bytes
-        data.extend_from_slice(&[0u8; 16]);
+        // TOKEN_USER header: 16 bytes, non-NULL
+        data.extend_from_slice(&[0xFFu8; 16]);
         // SID: S-1-5-21
         data.extend_from_slice(&sid_bytes(1, &[21]));
         // Sentinel
@@ -3835,7 +3861,7 @@ mod position_tests {
             .build_with_cache();
 
         let mut data = 0xAAAAu32.to_le_bytes().to_vec();
-        data.extend_from_slice(&[0u8; 16]); // TOKEN_USER
+        data.extend_from_slice(&[0xFFu8; 16]); // TOKEN_USER, non-NULL
         data.extend_from_slice(&sid_bytes(2, &[10, 20]));
         data.extend_from_slice(&0xBBBBu32.to_le_bytes());
 
@@ -3844,6 +3870,29 @@ mod position_tests {
         assert_eq!(val.sub_authorities, vec![10, 20]);
         let sentinel: u32 = parser.get("Sentinel").unwrap();
         assert_eq!(sentinel, 0xBBBB);
+    }
+
+    #[test]
+    fn dynamic_wbem_sid_missing_reads_as_0_and_keeps_offsets() {
+        let (schema, mut cache) = MockSchemaBuilder::new()
+            .add("Target", TdhInType::WbemSid, TdhOutType::Null)
+            .add("Sentinel", TdhInType::UInt32, TdhOutType::Null)
+            .build_with_cache();
+        let mut data = vec![0u8; 4];
+        data.extend_from_slice(&0xABCDu32.to_le_bytes());
+
+        let mut parser = EventParser::from_raw_parts(&data, &schema, &mut cache);
+        let owned: Sid = parser.get("Target").unwrap();
+        assert!(owned.is_missing());
+        assert_eq!(owned.to_string(), "0");
+        let borrowed: SidRef<'_> = parser.as_ref("Target").unwrap();
+        assert!(borrowed.is_missing());
+        assert_eq!(borrowed.as_bytes(), &[0; 4]);
+        assert_eq!(borrowed.to_string(), "0");
+        assert_eq!(parser.get::<u32>("Sentinel").unwrap(), 0xABCD);
+
+        let props = parser.named_properties().unwrap();
+        assert_eq!(props[0].1.to_string(), "0");
     }
 
     // =========================================================================

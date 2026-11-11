@@ -556,7 +556,7 @@ pub fn parse_following_sid(data: &[u8], start_offset: usize) -> Result<SidRef<'_
 ///
 /// # Errors
 ///
-/// Returns [`Error::ParseError`] if the buffer is too small or SID is invalid.
+/// Returns [`Error::ParseError`] if the buffer is too small for the SID.
 #[inline]
 pub fn parse_sid_sized(data: &[u8], start_offset: usize, size_bytes: usize) -> Result<SidRef<'_>> {
     if start_offset.saturating_add(size_bytes) > data.len() {
@@ -595,7 +595,8 @@ pub fn scan_past_sid(data: &[u8], start_offset: usize) -> Result<usize> {
 ///
 /// The size is `8 + 4 * SubAuthorityCount`, which is how TDH sizes a SID: the
 /// revision and the 15 sub-authority maximum are not checked, so an invalid SID
-/// still yields the offset of the field after it. [`SidRef::new`] validates.
+/// still yields the offset of the field after it. [`SidRef::is_valid`] reports
+/// whether the SID itself is valid.
 ///
 /// # Errors
 ///
@@ -630,28 +631,55 @@ pub fn compute_sid_size(data: &[u8], start_offset: usize) -> Result<usize> {
 /// bytes of padding; a 32-bit event's 8-byte header is misread.
 const WBEM_SID_TOKEN_USER_SIZE: usize = 16;
 
+/// The missing SID of the WbemSid at the start of `data`, if it is one.
+///
+/// TDH sizes any WbemSid that opens with a zero `u32` as those 4 bytes, standing in
+/// for the TOKEN_USER and SID; see [`SidRef::is_missing`].
+pub(crate) fn missing_wbem_sid(data: &[u8]) -> Option<SidRef<'_>> {
+    data.first_chunk::<4>()
+        .filter(|bytes| **bytes == [0; 4])
+        .map(SidRef::missing)
+}
+
+/// Size of the WbemSid at `start_offset`, given its TOKEN_USER header size.
+pub(crate) fn wbem_sid_size(
+    data: &[u8],
+    start_offset: usize,
+    token_user_size: usize,
+) -> Result<usize> {
+    let rest = data.get(start_offset..).unwrap_or_default();
+    if let Some(missing) = missing_wbem_sid(rest) {
+        return Ok(missing.as_bytes().len());
+    }
+    Ok(token_user_size + compute_sid_size(rest, token_user_size)?)
+}
+
 /// Computes the total byte size of a WbemSid field (TOKEN_USER header + SID).
 ///
-/// WbemSid fields have a 16-byte TOKEN_USER prefix followed by a standard SID.
-/// The SID size is self-describing via its SubAuthorityCount field.
+/// WbemSid fields have a 16-byte TOKEN_USER prefix followed by a standard SID,
+/// sized as [`compute_sid_size`] does. A field that opens with a zero `u32` carries
+/// no SID and is 4 bytes, as TDH sizes it.
 ///
 /// # Errors
 ///
 /// Returns [`Error::ParseError`] if the buffer is too small.
 #[inline]
 pub fn compute_wbem_sid_size(data: &[u8], start_offset: usize) -> Result<usize> {
-    let sid_offset = start_offset + WBEM_SID_TOKEN_USER_SIZE;
-    let sid_size = compute_sid_size(data, sid_offset)?;
-    Ok(WBEM_SID_TOKEN_USER_SIZE + sid_size)
+    wbem_sid_size(data, start_offset, WBEM_SID_TOKEN_USER_SIZE)
 }
 
 /// Parse a WbemSid field, skipping the TOKEN_USER header to return the SID.
 ///
+/// A field with no SID yields a [missing](SidRef::is_missing) `SidRef`.
+///
 /// # Errors
 ///
-/// Returns [`Error::ParseError`] if the buffer is too small or the SID is invalid.
+/// Returns [`Error::ParseError`] if the buffer is too small.
 #[inline]
 pub fn parse_wbem_sid(data: &[u8], start_offset: usize) -> Result<SidRef<'_>> {
+    if let Some(missing) = data.get(start_offset..).and_then(missing_wbem_sid) {
+        return Ok(missing);
+    }
     let sid_offset = start_offset + WBEM_SID_TOKEN_USER_SIZE;
     let sid_size = compute_sid_size(data, sid_offset)?;
     SidRef::parse(&data[sid_offset..sid_offset + sid_size])
@@ -659,15 +687,20 @@ pub fn parse_wbem_sid(data: &[u8], start_offset: usize) -> Result<SidRef<'_>> {
 
 /// Parse a WbemSid with a pre-computed total size (TOKEN_USER + SID).
 ///
+/// A field with no SID yields a [missing](SidRef::is_missing) `SidRef`.
+///
 /// # Errors
 ///
-/// Returns [`Error::ParseError`] if the buffer is too small or the SID is invalid.
+/// Returns [`Error::ParseError`] if the buffer is too small.
 #[inline]
 pub fn parse_wbem_sid_sized(
     data: &[u8],
     start_offset: usize,
     size_bytes: usize,
 ) -> Result<SidRef<'_>> {
+    if let Some(missing) = data.get(start_offset..).and_then(missing_wbem_sid) {
+        return Ok(missing);
+    }
     if size_bytes < WBEM_SID_TOKEN_USER_SIZE {
         return Err(Error::parse("WbemSid size too small for TOKEN_USER header"));
     }
@@ -1831,7 +1864,7 @@ mod tests {
 
     #[test]
     fn test_parse_wbem_sid_valid() {
-        let mut data = vec![0u8; 16]; // TOKEN_USER header (16 bytes)
+        let mut data = vec![0xFFu8; 16]; // TOKEN_USER header (16 bytes)
         data.extend_from_slice(&local_system_sid_bytes());
         let sid = parse_wbem_sid(&data, 0).expect("should parse");
         assert_eq!(sid.revision(), 1);
@@ -1840,13 +1873,13 @@ mod tests {
 
     #[test]
     fn test_parse_wbem_sid_too_short() {
-        let data = [0u8; 15]; // shorter than TOKEN_USER header (16 bytes)
+        let data = [0xFFu8; 15]; // shorter than TOKEN_USER header (16 bytes)
         assert!(parse_wbem_sid(&data, 0).is_err());
     }
 
     #[test]
     fn test_parse_wbem_sid_sized_valid() {
-        let mut data = vec![0u8; 16]; // TOKEN_USER header
+        let mut data = vec![0xFFu8; 16]; // TOKEN_USER header
         data.extend_from_slice(&local_system_sid_bytes());
         let total = data.len();
         let sid = parse_wbem_sid_sized(&data, 0, total).expect("should parse");
@@ -1855,7 +1888,7 @@ mod tests {
 
     #[test]
     fn test_parse_wbem_sid_sized_size_too_small() {
-        let mut data = vec![0u8; 16];
+        let mut data = vec![0xFFu8; 16];
         data.extend_from_slice(&local_system_sid_bytes());
         // size_bytes < WBEM_SID_TOKEN_USER_SIZE (16)
         assert!(parse_wbem_sid_sized(&data, 0, 8).is_err());
@@ -2040,10 +2073,25 @@ mod tests {
 
     #[test]
     fn test_compute_wbem_sid_size_valid() {
-        let mut data = vec![0u8; 16]; // TOKEN_USER header
+        let mut data = vec![0xFFu8; 16]; // TOKEN_USER header
         data.extend_from_slice(&local_system_sid_bytes());
         let size = compute_wbem_sid_size(&data, 0).expect("should succeed");
         assert_eq!(size, 16 + 12); // header + S-1-5-18
+    }
+
+    #[test]
+    fn test_wbem_sid_missing_is_four_bytes_and_reads_as_missing() {
+        let mut data = vec![0xAA, 0, 0, 0, 0];
+        data.extend_from_slice(&local_system_sid_bytes());
+        assert_eq!(compute_wbem_sid_size(&data, 1).ok(), Some(4));
+        for sid in [
+            parse_wbem_sid(&data, 1).expect("missing SID reads"),
+            parse_wbem_sid_sized(&data, 1, 4).expect("missing SID reads"),
+        ] {
+            assert!(sid.is_missing());
+            assert_eq!(sid.to_string(), "0");
+        }
+        assert!(compute_wbem_sid_size(&data[..4], 1).is_err());
     }
 
     // ========================================================================

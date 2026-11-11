@@ -49,11 +49,18 @@ use etw::RawEvent;
 use std::{ffi::c_void, sync::OnceLock};
 use windows::{
     Win32::System::Diagnostics::Etw::{
-        EVENT_DESCRIPTOR, EVENT_RECORD, PROPERTY_DATA_DESCRIPTOR, TdhGetProperty,
-        TdhGetPropertySize, TdhLoadManifest,
+        EVENT_DESCRIPTOR, EVENT_RECORD, PROPERTY_DATA_DESCRIPTOR, PropertyParamCount,
+        PropertyParamLength, PropertyStruct, TRACE_EVENT_INFO, TdhFormatProperty,
+        TdhGetEventInformation, TdhGetProperty, TdhGetPropertySize, TdhLoadManifest,
     },
-    core::{GUID, PCWSTR},
+    core::{GUID, PCWSTR, PWSTR},
 };
+
+/// `ERROR_INSUFFICIENT_BUFFER`: the size probe of a TDH call succeeded.
+const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+
+/// `ERROR_NOT_FOUND`: no top-level property has the requested name.
+const ERROR_NOT_FOUND: u32 = 1168;
 
 /// Provider GUID declared by `tests/fixtures/differential.man`.
 pub const PROVIDER: GUID = GUID::from_u128(0x6f5b3a21_9c4e_4d17_b8a6_2e7f10c4d983);
@@ -70,6 +77,9 @@ pub const LEAD: u8 = 0xC3;
 
 /// `EVENT_HEADER_FLAG_64_BIT_HEADER` — selects 8-byte `win:Pointer` fields.
 pub const FLAG_64_BIT: u16 = 0x0200;
+
+/// `EVENT_HEADER_FLAG_CLASSIC_HEADER` — the record is a classic (MOF) event.
+pub const FLAG_CLASSIC: u16 = 0x0100;
 
 /// `EVENT_HEADER_FLAG_32_BIT_HEADER`.
 ///
@@ -160,6 +170,17 @@ impl TestRecord {
         Self::new(event_id, payload, FLAG_64_BIT)
     }
 
+    /// Assembles a 64-bit classic (MOF) record for `class`, keyed by version and
+    /// opcode (event type) as MOF events are. TDH resolves the class from the WMI
+    /// repository, so no manifest is involved.
+    pub fn new_classic(class: GUID, version: u8, opcode: u8, payload: Vec<u8>) -> Self {
+        let mut this = Self::new(0, payload, FLAG_CLASSIC | FLAG_64_BIT);
+        this.record.EventHeader.ProviderId = class;
+        this.record.EventHeader.EventDescriptor.Version = version;
+        this.record.EventHeader.EventDescriptor.Opcode = opcode;
+        this
+    }
+
     /// Borrows the record as an etw-rs [`RawEvent`], the same type a live callback
     /// receives, so tests run the production parsing path rather than a test-only
     /// entry point.
@@ -214,6 +235,121 @@ pub fn tdh_property_bytes_at(event: &RawEvent, name: &str, index: u32) -> Result
         return Err(status);
     }
     Ok(buf)
+}
+
+/// How `TdhFormatProperty` renders a top-level property, as text.
+///
+/// The bytes come from [`tdh_property_bytes`], so this checks formatting only; the
+/// extent is compared separately.
+///
+/// # Panics
+///
+/// Panics unless the property is a scalar with no value map: a struct, an array,
+/// or a length or count taken from another property would need arguments this
+/// does not pass.
+pub fn tdh_format_property(event: &RawEvent, name: &str) -> Result<String, u32> {
+    let record = std::ptr::from_ref(event.as_raw()).cast::<EVENT_RECORD>();
+
+    let mut size = 0u32;
+    // SAFETY: `record` is valid for the borrow of `event`; a null buffer asks for
+    // the size only.
+    let status = unsafe { TdhGetEventInformation(record, None, None, &raw mut size) };
+    if status != ERROR_INSUFFICIENT_BUFFER {
+        return Err(status);
+    }
+    // u64 elements give the buffer TRACE_EVENT_INFO's 8-byte alignment.
+    let mut buf = vec![0u64; (size as usize).div_ceil(8)];
+    let info = buf.as_mut_ptr().cast::<TRACE_EVENT_INFO>();
+    // SAFETY: `buf` holds at least `size` bytes, aligned for TRACE_EVENT_INFO.
+    let status = unsafe { TdhGetEventInformation(record, None, Some(info), &raw mut size) };
+    if status != 0 {
+        return Err(status);
+    }
+    // SAFETY: TdhGetEventInformation succeeded, so `info` is initialised and its
+    // property array holds TopLevelPropertyCount entries inside `buf`.
+    let (info_ref, props) = unsafe {
+        let info_ref = &*info;
+        let props = std::slice::from_raw_parts(
+            info_ref.EventPropertyInfoArray.as_ptr(),
+            info_ref.TopLevelPropertyCount as usize,
+        );
+        (info_ref, props)
+    };
+    let base = buf.as_ptr().cast::<u8>();
+    let prop = props
+        .iter()
+        // SAFETY: NameOffset locates a NUL-terminated UTF-16 name inside `buf`.
+        .find(|p| unsafe {
+            PCWSTR(base.add(p.NameOffset as usize).cast()).to_string().ok() == Some(name.to_owned())
+        })
+        .ok_or(ERROR_NOT_FOUND)?;
+    let unsupported = PropertyStruct.0 | PropertyParamLength.0 | PropertyParamCount.0;
+    assert_eq!(
+        prop.Flags.0 & unsupported,
+        0,
+        "{name}: struct and param-length/count properties are not supported"
+    );
+    // SAFETY: the property is not a struct (asserted above), so its type lives in
+    // `nonStructType`; with no param count or length, `count` and `length` are values.
+    let (in_type, out_type, map_name_offset, count, length) = unsafe {
+        (
+            prop.Anonymous1.nonStructType.InType,
+            prop.Anonymous1.nonStructType.OutType,
+            prop.Anonymous1.nonStructType.MapNameOffset,
+            prop.Anonymous2.count,
+            prop.Anonymous3.length,
+        )
+    };
+    assert_eq!(count, 1, "{name}: arrays are not supported");
+    assert_eq!(map_name_offset, 0, "{name}: value maps are not supported");
+    let pointer_size = if event.as_raw().EventHeader.Flags & FLAG_32_BIT != 0 {
+        4
+    } else {
+        8
+    };
+
+    let bytes = tdh_property_bytes(event, name)?;
+    let mut out_size = 0u32;
+    let mut consumed = 0u16;
+    // SAFETY: `info_ref` and `bytes` outlive the call; a null buffer asks for the size.
+    let status = unsafe {
+        TdhFormatProperty(
+            info_ref,
+            None,
+            pointer_size,
+            in_type,
+            out_type,
+            length,
+            &bytes,
+            &raw mut out_size,
+            None,
+            &raw mut consumed,
+        )
+    };
+    if status != ERROR_INSUFFICIENT_BUFFER {
+        return Err(status);
+    }
+    let mut out = vec![0u16; (out_size as usize).div_ceil(2)];
+    // SAFETY: `out` holds `out_size` bytes; same argument validity as the size call.
+    let status = unsafe {
+        TdhFormatProperty(
+            info_ref,
+            None,
+            pointer_size,
+            in_type,
+            out_type,
+            length,
+            &bytes,
+            &raw mut out_size,
+            Some(PWSTR(out.as_mut_ptr())),
+            &raw mut consumed,
+        )
+    };
+    if status != 0 {
+        return Err(status);
+    }
+    let len = out.iter().position(|&c| c == 0).unwrap_or(out.len());
+    Ok(String::from_utf16_lossy(&out[..len]))
 }
 
 /// What TDH says one member of a struct occupies.

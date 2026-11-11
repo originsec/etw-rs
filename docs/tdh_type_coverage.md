@@ -76,7 +76,8 @@ may also carry `@ out(...)` — see [TdhOutType Decoding](#tdhouttype-decoding).
 
 The dynamic parser sizes `WbemSid` from the event's pointer size, but its decoding (`Sid`, `SidRef`,
 `Display`) always skips a 16-byte header; the static `WbemSidRef` both sizes and decodes with that
-fixed 16 bytes. Either way a 32-bit event's SID is misread or rejected.
+fixed 16 bytes. Either way a 32-bit event's SID is misread or rejected. A `WbemSid` whose first four
+bytes are zero carries no SID and is 4 bytes in both parsers, as TDH sizes it.
 
 `Binary` does not apply the `<tdh.h>` rule that an `Ipv6` out-type implies 16 bytes
 (`compute_variable_element_size`). `NonNullTerminated*` are not sized as "rest of the event": with
@@ -248,5 +249,4 @@ linkage fixtures in `tests/differential_offline.rs`.
 | `NonNullTerminated*` sizing | Low | Rare (WPP/legacy). Readable only with a declared length or `PropertyParamLength`. |
 | `UnicodeChar` / `AnsiChar` / `HexDump` | Low | Rare (legacy). No `FromProperty` impl. |
 | `WbemSid` from 32-bit events | Low | Dynamic: sized correctly, decoded with a 64-bit `TOKEN_USER` header. Static `WbemSidRef`: sized and decoded with it. |
-| `WbemSid` with a NULL `TOKEN_USER.Sid` | Unknown | TDH sizes a `WbemSid` whose first four bytes are zero as a 4-byte "no SID" value (formatted `0`); etw-rs always expects the header and a SID, so it misplaces every later property. Not seen in kernel Process rundowns. |
 | 32-bit `Pointer` / `SizeT` offline | Low | `TdhLoadManifest` bakes in 8 bytes; covered live by `tests/32bit_events.rs` and `tests/mixed_bitness_events.rs`. |

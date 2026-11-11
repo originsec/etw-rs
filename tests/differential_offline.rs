@@ -364,6 +364,31 @@ fn edge_records() -> Vec<Fixture> {
         });
     }
 
+    // Invalid SIDs, which TDH still sizes as 8 + 4 * count: the sentinel after
+    // each must be found, as TDH finds it.
+    let invalid_sid = |revision: u8, count: usize| {
+        let mut s = sid(&vec![1; count]);
+        s[0] = revision;
+        s
+    };
+    for (label, subject) in [
+        ("SidRevision0", invalid_sid(0, 2)),
+        ("SidRevision2", invalid_sid(2, 2)),
+        ("SidCount16", invalid_sid(1, 16)),
+        ("SidCount255", invalid_sid(1, 255)),
+    ] {
+        out.push(Fixture {
+            label: label.to_owned(),
+            record: TestRecord::new_64bit(
+                id_for("Sid", Shape::Fixed),
+                Shape::Fixed.payload_for(&subject, 0),
+            ),
+            shape: Some(Shape::Fixed),
+            in_type: None,
+            count: 0,
+        });
+    }
+
     // count == 0 on a run-time-counted array: one fixed-size element type, one
     // variable-size, one self-describing.
     for label in ["UInt32", "UnicodeString", "Sid"] {
@@ -931,7 +956,7 @@ fn fixture_set_covers_the_expected_surface() {
         "shape matrix should be every in-type in every shape"
     );
     assert_eq!(linkage_records().len(), 12, "linkage fixture count changed");
-    assert_eq!(edge_records().len(), 7, "edge-case fixture count changed");
+    assert_eq!(edge_records().len(), 11, "edge-case fixture count changed");
 
     let per_type: usize = Shape::ALL.iter().map(|s| s.property_count()).sum();
     // ParamLength 4, ParamCount 4, TwoStrings 4, AnsiThenUnicode 4, UnicodeThenAnsi 4,
@@ -939,10 +964,11 @@ fn fixture_set_covers_the_expected_surface() {
     // ParamLengthAfterVariable 5, ParamCountAfterVariable 5, ParamLengthAndCount 5,
     // ParamLengthStaticCount 4.
     let expected_linkage = 49usize;
-    // Three empty variable fields in the Fixed shape (3 each), three count == 0
-    // arrays in the ArrayParamCount shape (4 each), one zero-length ParamLength (4).
+    // Three empty variable fields and four invalid SIDs in the Fixed shape (3 each),
+    // three count == 0 arrays in the ArrayParamCount shape (4 each), one zero-length
+    // ParamLength (4).
     let expected_edge =
-        3 * Shape::Fixed.property_count() + 3 * Shape::ArrayParamCount.property_count() + 4;
+        7 * Shape::Fixed.property_count() + 3 * Shape::ArrayParamCount.property_count() + 4;
 
     let mut compared = 0usize;
     for f in all_records() {

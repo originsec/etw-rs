@@ -314,7 +314,8 @@ pub enum TdhInType {
     /// `TDH_INTYPE_SID` (19) — security identifier.
     ///
     /// Self-describing: the sub-authority count is read from the second byte of the field, giving
-    /// `8 + sub_authority_count * 4` bytes.
+    /// `8 + sub_authority_count * 4` bytes. TDH sizes it that way without validating the SID, so a
+    /// bad revision or a count past 15 still has a size.
     Sid,
     /// `TDH_INTYPE_HEXINT32` (20) — 32-bit integer displayed as hexadecimal. Always 4 bytes.
     HexInt32,
@@ -1975,23 +1976,39 @@ impl<'a> SidRef<'a> {
     /// or the revision is not 1 (the only valid SID revision defined by Windows).
     #[must_use]
     pub fn new(data: &'a [u8]) -> Option<Self> {
+        Self::parse(data).ok()
+    }
+
+    /// [`SidRef::new`], with an error saying which check failed.
+    pub(crate) fn parse(data: &'a [u8]) -> Result<Self> {
         if data.len() < 8 {
-            return None;
+            return Err(Error::parse(format!(
+                "Insufficient data for SID header: need 8 bytes, have {}",
+                data.len()
+            )));
         }
+        let revision = data[0];
         // SID_REVISION (1) is the only valid revision per the Windows SDK.
-        if data[0] != 1 {
-            return None;
+        if revision != 1 {
+            return Err(Error::parse(format!(
+                "Invalid SID revision {revision} (expected 1)"
+            )));
         }
         let sub_auth_count = data[1] as usize;
         // SID_MAX_SUB_AUTHORITIES = 15 per the Windows SDK.
         if sub_auth_count > 15 {
-            return None;
+            return Err(Error::parse(format!(
+                "SID sub-authority count {sub_auth_count} exceeds maximum of 15"
+            )));
         }
         let expected_len = 8 + sub_auth_count * 4;
         if data.len() < expected_len {
-            return None;
+            return Err(Error::parse(format!(
+                "Insufficient data for SID: need {expected_len} bytes, have {}",
+                data.len()
+            )));
         }
-        Some(Self(&data[..expected_len]))
+        Ok(Self(&data[..expected_len]))
     }
 
     /// Returns the raw SID bytes.

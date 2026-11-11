@@ -55,11 +55,12 @@ use crate::{
     Error, Result,
     event::Timestamp,
     processing_context::EventSchema,
+    static_schema::compute_sid_size,
     types::{
         AnsiStrRef, AnsiString, Guid, Sid, SidRef, SystemTime, TdhInType, TdhOutType, WideStrRef,
     },
 };
-use windows_sys::Win32::{Globalization::CP_UTF8, System::SystemServices::SID_MAX_SUB_AUTHORITIES};
+use windows_sys::Win32::Globalization::CP_UTF8;
 
 /// Cached information about a parsed property's location in the buffer.
 ///
@@ -1418,18 +1419,7 @@ impl<'a> EventParser<'a> {
                         Error::parse("No null terminator found for AnsiString")
                     })
             }
-            TdhInType::Sid => {
-                if remaining.len() < 8 {
-                    return Err(Error::parse("Insufficient data for SID"));
-                }
-                let sub_auth_count = remaining[1] as usize;
-                if sub_auth_count > SID_MAX_SUB_AUTHORITIES as usize {
-                    return Err(Error::parse(format!(
-                        "SID sub-authority count {sub_auth_count} exceeds maximum of {SID_MAX_SUB_AUTHORITIES}"
-                    )));
-                }
-                Ok(8 + sub_auth_count * 4)
-            }
+            TdhInType::Sid => compute_sid_size(remaining, 0),
             TdhInType::CountedString | TdhInType::ReversedCountedString => {
                 if remaining.len() < 2 {
                     return Err(Error::parse("Insufficient data for CountedString"));
@@ -1486,17 +1476,7 @@ impl<'a> EventParser<'a> {
             }
             TdhInType::WbemSid => {
                 let hdr = token_user_size(pointer_size);
-                if remaining.len() < hdr + 8 {
-                    return Err(Error::parse("Insufficient data for WbemSid"));
-                }
-                let sub_auth_count = remaining[hdr + 1] as usize;
-                if sub_auth_count > SID_MAX_SUB_AUTHORITIES as usize {
-                    return Err(Error::parse(format!(
-                        "WbemSid sub-authority count {sub_auth_count} exceeds maximum of {SID_MAX_SUB_AUTHORITIES}"
-                    )));
-                }
-                let sid_size = 8 + sub_auth_count * 4;
-                Ok(hdr + sid_size)
+                Ok(hdr + compute_sid_size(remaining, hdr)?)
             }
             _ => Err(Error::parse(format!(
                 "Cannot determine size for type {in_type:?}"
@@ -2251,52 +2231,7 @@ impl FromProperty for Sid {
                 }
                 Self::from_property(&data[hdr..], TdhInType::Sid, TdhOutType::Null)
             }
-            TdhInType::Sid => {
-                if data.len() < 8 {
-                    return Err(Error::parse("Insufficient data for SID"));
-                }
-                let revision = data[0];
-                // SID_REVISION (1) is the only valid revision per the Windows SDK.
-                if revision != 1 {
-                    return Err(Error::parse(format!(
-                        "Invalid SID revision {revision} (expected 1)"
-                    )));
-                }
-                let sub_auth_count = data[1] as usize;
-                if sub_auth_count > SID_MAX_SUB_AUTHORITIES as usize {
-                    return Err(Error::parse(format!(
-                        "SID sub-authority count {sub_auth_count} exceeds maximum of {SID_MAX_SUB_AUTHORITIES}"
-                    )));
-                }
-                let mut authority = [0u8; 6];
-                authority.copy_from_slice(&data[2..8]);
-
-                let expected_len = 8 + sub_auth_count * 4;
-                if data.len() < expected_len {
-                    return Err(Error::parse(format!(
-                        "Insufficient data for SID: need {} bytes, have {}",
-                        expected_len,
-                        data.len()
-                    )));
-                }
-
-                let mut sub_authorities = Vec::with_capacity(sub_auth_count);
-                for i in 0..sub_auth_count {
-                    let offset = 8 + i * 4;
-                    sub_authorities.push(u32::from_le_bytes([
-                        data[offset],
-                        data[offset + 1],
-                        data[offset + 2],
-                        data[offset + 3],
-                    ]));
-                }
-
-                Ok(Self {
-                    revision,
-                    authority,
-                    sub_authorities,
-                })
-            }
+            TdhInType::Sid => SidRef::parse(data).map(|sid| sid.to_owned()),
             _ => Err(Error::parse(format!("Cannot parse Sid from {in_type:?}"))),
         }
     }
@@ -2414,12 +2349,9 @@ impl<'a> FromPropertyRef<'a> for SidRef<'a> {
                 if data.len() <= hdr {
                     return Err(Error::parse("Insufficient data for WbemSid"));
                 }
-                SidRef::new(&data[hdr..])
-                    .ok_or_else(|| Error::parse("Invalid SID in WbemSid payload"))
+                SidRef::parse(&data[hdr..])
             }
-            TdhInType::Sid => {
-                SidRef::new(data).ok_or_else(|| Error::parse("Invalid SID: data too short"))
-            }
+            TdhInType::Sid => SidRef::parse(data),
             _ => Err(Error::parse(format!(
                 "Cannot borrow SidRef from {in_type:?} (expected Sid)"
             ))),
@@ -3504,12 +3436,26 @@ mod tests {
     }
 
     #[test]
-    fn test_variable_size_wbem_sid_subauth_count_too_large() {
-        // 16-byte header + SID with sub_auth_count = 16 (> 15 max)
-        let mut data = vec![0u8; 24];
+    fn test_variable_size_wbem_sid_sizes_invalid_sid_by_count() {
+        // TDH sizes the SID as 8 + 4 * count even past the 15 maximum, and only
+        // fails when the bytes are not there.
+        let mut data = vec![0xFFu8; 16 + 8 + 16 * 4];
         data[16] = 0x01; // revision
-        data[17] = 0x10; // sub_auth_count = 16 (out of range)
-        let r = EventParser::compute_variable_element_size(&data, TdhInType::WbemSid, 8);
+        data[17] = 16; // sub_auth_count, one past SID_MAX_SUB_AUTHORITIES
+        let size = EventParser::compute_variable_element_size(&data, TdhInType::WbemSid, 8);
+        assert_eq!(size.ok(), Some(16 + 8 + 16 * 4));
+        let truncated = &data[..data.len() - 1];
+        let r = EventParser::compute_variable_element_size(truncated, TdhInType::WbemSid, 8);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn test_variable_size_sid_sizes_invalid_sid_by_count() {
+        let mut data = vec![0u8, 2, 0, 0, 0, 0, 0, 5]; // revision 0
+        data.resize(16, 0);
+        let size = EventParser::compute_variable_element_size(&data, TdhInType::Sid, 8);
+        assert_eq!(size.ok(), Some(16));
+        let r = EventParser::compute_variable_element_size(&data[..15], TdhInType::Sid, 8);
         assert!(r.is_err());
     }
 
@@ -3825,6 +3771,18 @@ mod position_tests {
         let val: SidRef = parser.as_ref("Target").unwrap();
         assert_eq!(val.sub_authority(0), Some(10));
         assert_eq!(val.sub_authority(1), Some(20));
+    }
+
+    #[test]
+    fn sid_array_with_truncated_element_errors() {
+        let (schema, mut cache) = MockSchemaBuilder::new()
+            .add_static_array("Sids", TdhInType::Sid, TdhOutType::Null, 2)
+            .build_with_cache();
+        let mut data = sid_bytes(1, &[18]);
+        let second = sid_bytes(1, &[19]);
+        data.extend_from_slice(&second[..second.len() - 2]);
+        let mut parser = EventParser::from_raw_parts(&data, &schema, &mut cache);
+        assert!(parser.array_elements("Sids").is_err());
     }
 
     #[test]

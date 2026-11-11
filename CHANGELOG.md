@@ -19,6 +19,8 @@
 ### Fixed
 
 - ANSI strings decode as UTF-8 when their out-type is `Utf8`, `Json` or `Xml`.
+- An invalid SID no longer misplaces the properties after it.
+- `array_elements()` returns an error instead of panicking on a truncated SID.
 
 ## [0.1.0] - 2026-10-23
 

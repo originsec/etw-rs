@@ -712,9 +712,8 @@ fn sid_rejects_invalid_revision() {
     let msg = result.unwrap_err().to_string();
     assert!(msg.contains("revision"), "unexpected error: {msg}");
 
-    // And by scan_past_sid.
-    let result = etw::static_schema::scan_past_sid(&data, 0);
-    assert!(result.is_err());
+    // But still skipped, as TDH sizes it: by count, not validity.
+    assert_eq!(etw::static_schema::scan_past_sid(&data, 0).ok(), Some(12));
 }
 
 #[test]
@@ -736,10 +735,11 @@ fn wbem_sid_rejects_invalid_revision() {
     data[16] = 0; // Invalid revision (should be 1)
     data[17] = 1; // SubAuthorityCount = 1
 
-    let result = etw::static_schema::compute_wbem_sid_size(&data, 0);
-    assert!(result.is_err());
-    let msg = result.unwrap_err().to_string();
-    assert!(msg.contains("revision"), "unexpected error: {msg}");
+    // Sized as TDH does, by count, so the field after it is still found.
+    assert_eq!(
+        etw::static_schema::compute_wbem_sid_size(&data, 0).ok(),
+        Some(28)
+    );
 
     let result = etw::static_schema::parse_wbem_sid(&data, 0);
     assert!(result.is_err());

@@ -546,10 +546,7 @@ pub fn scan_past_ansi_string(data: &[u8], start_offset: usize) -> Result<usize> 
 #[inline]
 pub fn parse_following_sid(data: &[u8], start_offset: usize) -> Result<SidRef<'_>> {
     let sid_size = compute_sid_size(data, start_offset)?;
-    // compute_sid_size already validates revision, sub-authority count, and bounds,
-    // so SidRef::new will always succeed here — the error arm is unreachable.
-    SidRef::new(&data[start_offset..start_offset + sid_size])
-        .ok_or_else(|| Error::parse("invalid SID structure"))
+    SidRef::parse(&data[start_offset..start_offset + sid_size])
 }
 
 /// Parse a SID with a pre-computed size (no re-computation).
@@ -566,17 +563,16 @@ pub fn parse_sid_sized(data: &[u8], start_offset: usize, size_bytes: usize) -> R
         return Err(Error::parse("insufficient data for SID"));
     }
 
-    // Wrap the SID bytes in a SidRef
-    SidRef::new(&data[start_offset..start_offset + size_bytes])
-        .ok_or_else(|| Error::parse("invalid SID structure"))
+    SidRef::parse(&data[start_offset..start_offset + size_bytes])
 }
 
 /// Scan past a Windows SID (Security Identifier) and return the offset after it.
 ///
+/// Sized as [`compute_sid_size`] does, so an invalid SID is still skipped.
+///
 /// # Errors
 ///
-/// Returns [`Error::ParseError`] if the buffer is too small, the revision byte
-/// is not 1, or `SubAuthorityCount` exceeds `SID_MAX_SUB_AUTHORITIES` (15).
+/// Returns [`Error::ParseError`] if the buffer is too small for the SID.
 ///
 /// # Example
 ///
@@ -597,36 +593,20 @@ pub fn scan_past_sid(data: &[u8], start_offset: usize) -> Result<usize> {
 
 /// Computes the byte size of a self-describing SID starting at `start_offset`.
 ///
-/// Validates the SID revision byte and that `SubAuthorityCount` does not
-/// exceed `SID_MAX_SUB_AUTHORITIES` (15) per the Windows Security Reference.
+/// The size is `8 + 4 * SubAuthorityCount`, which is how TDH sizes a SID: the
+/// revision and the 15 sub-authority maximum are not checked, so an invalid SID
+/// still yields the offset of the field after it. [`SidRef::new`] validates.
 ///
 /// # Errors
 ///
-/// Returns [`Error::ParseError`] if the buffer is too small, the revision byte
-/// is not 1, or `SubAuthorityCount` exceeds 15.
+/// Returns [`Error::ParseError`] if the buffer is too small for the SID.
 #[inline]
 pub fn compute_sid_size(data: &[u8], start_offset: usize) -> Result<usize> {
     if start_offset.saturating_add(8) > data.len() {
         return Err(Error::parse("insufficient data for SID header"));
     }
 
-    // SID_REVISION (1) is the only valid revision.
-    if data[start_offset] != 1 {
-        return Err(Error::parse(format!(
-            "invalid SID revision {} (expected 1)",
-            data[start_offset]
-        )));
-    }
-
-    let sub_authority_count = data[start_offset + 1] as usize;
-    // SID_MAX_SUB_AUTHORITIES = 15 per the Windows Security Reference.
-    if sub_authority_count > 15 {
-        return Err(Error::parse(format!(
-            "SID SubAuthorityCount {sub_authority_count} exceeds SID_MAX_SUB_AUTHORITIES (15)"
-        )));
-    }
-
-    let sid_size = 8 + sub_authority_count * 4;
+    let sid_size = 8 + data[start_offset + 1] as usize * 4;
     if start_offset.saturating_add(sid_size) > data.len() {
         return Err(Error::parse(format!(
             "insufficient data for SID: need {} bytes, have {} bytes",
@@ -674,8 +654,7 @@ pub fn compute_wbem_sid_size(data: &[u8], start_offset: usize) -> Result<usize> 
 pub fn parse_wbem_sid(data: &[u8], start_offset: usize) -> Result<SidRef<'_>> {
     let sid_offset = start_offset + WBEM_SID_TOKEN_USER_SIZE;
     let sid_size = compute_sid_size(data, sid_offset)?;
-    SidRef::new(&data[sid_offset..sid_offset + sid_size])
-        .ok_or_else(|| Error::parse("invalid SID in WbemSid payload"))
+    SidRef::parse(&data[sid_offset..sid_offset + sid_size])
 }
 
 /// Parse a WbemSid with a pre-computed total size (TOKEN_USER + SID).
@@ -699,8 +678,7 @@ pub fn parse_wbem_sid_sized(
     let sid_offset = start_offset + WBEM_SID_TOKEN_USER_SIZE;
     let sid_size = size_bytes - WBEM_SID_TOKEN_USER_SIZE;
 
-    SidRef::new(&data[sid_offset..sid_offset + sid_size])
-        .ok_or_else(|| Error::parse("invalid SID in WbemSid payload"))
+    SidRef::parse(&data[sid_offset..sid_offset + sid_size])
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -2025,17 +2003,27 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_sid_size_invalid_revision_errors() {
-        let mut data = local_system_sid_bytes();
-        data[0] = 2; // revision 2 is invalid
-        assert!(compute_sid_size(&data, 0).is_err());
+    fn test_compute_sid_size_sizes_invalid_sids_by_count() {
+        // TDH sizes a SID as 8 + 4 * count without validating it, so the field
+        // after an invalid SID is still found.
+        for revision in [0, 2, 255] {
+            let mut data = local_system_sid_bytes();
+            data[0] = revision;
+            assert_eq!(
+                compute_sid_size(&data, 0).ok(),
+                Some(12),
+                "revision {revision}"
+            );
+        }
+        let mut data = vec![0x01u8, 255, 0, 0, 0, 0, 0, 5];
+        data.resize(8 + 255 * 4, 0);
+        assert_eq!(compute_sid_size(&data, 0).ok(), Some(8 + 255 * 4));
     }
 
     #[test]
-    fn test_compute_sid_size_subauth_count_too_large_errors() {
-        let mut data = local_system_sid_bytes();
-        data[1] = 16; // SubAuthorityCount = 16 > 15
-        assert!(compute_sid_size(&data, 0).is_err());
+    fn test_compute_sid_size_header_too_small_errors() {
+        assert!(compute_sid_size(&local_system_sid_bytes()[..7], 0).is_err());
+        assert!(compute_sid_size(&local_system_sid_bytes(), 5).is_err());
     }
 
     #[test]

@@ -248,4 +248,5 @@ linkage fixtures in `tests/differential_offline.rs`.
 | `NonNullTerminated*` sizing | Low | Rare (WPP/legacy). Readable only with a declared length or `PropertyParamLength`. |
 | `UnicodeChar` / `AnsiChar` / `HexDump` | Low | Rare (legacy). No `FromProperty` impl. |
 | `WbemSid` from 32-bit events | Low | Dynamic: sized correctly, decoded with a 64-bit `TOKEN_USER` header. Static `WbemSidRef`: sized and decoded with it. |
+| `WbemSid` with a NULL `TOKEN_USER.Sid` | Unknown | TDH sizes a `WbemSid` whose first four bytes are zero as a 4-byte "no SID" value (formatted `0`); etw-rs always expects the header and a SID, so it misplaces every later property. Not seen in kernel Process rundowns. |
 | 32-bit `Pointer` / `SizeT` offline | Low | `TdhLoadManifest` bakes in 8 bytes; covered live by `tests/32bit_events.rs` and `tests/mixed_bitness_events.rs`. |

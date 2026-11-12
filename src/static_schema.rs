@@ -1528,7 +1528,7 @@ fn validate_next_version_hints(
             {
                 // info not warn: this is a performance degradation (hint miss → O(1) hash
                 // lookup instead of direct index), not a correctness failure. Debug builds
-                // already panic above.
+                // return the error instead.
                 log::info!("{err}");
                 return Ok(());
             }

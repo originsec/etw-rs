@@ -1,6 +1,12 @@
 //! Provider name and GUID resolution.
 //!
 //! Convenience functions for looking up registered ETW providers by name or GUID.
+//!
+//! Each lookup enumerates the registered providers, MOF ones included through
+//! WMI, so it initialises and uninitialises the COM multithreaded apartment on
+//! the calling thread, twice. See [`ProcessingContext`'s COM
+//! notes](crate::processing_context::ProcessingContext#com) for why that matters
+//! to a process that uses COM.
 
 // TODO(jdu) FUTURE These functions could benefit from caching, but are used infrequently
 
@@ -86,6 +92,8 @@ pub fn provider_name_from_guid(guid: &crate::Guid) -> Option<String> {
 fn scan_providers<T>(
     mut callback: impl FnMut(&TRACE_PROVIDER_INFO, &str) -> Option<T>,
 ) -> Result<Option<T>> {
+    crate::mta::warn_if_no_mta(format_args!("TdhEnumerateProviders"));
+
     let mut buffer_size = 0u32;
 
     // SAFETY: First call with null buffer to query the required size.

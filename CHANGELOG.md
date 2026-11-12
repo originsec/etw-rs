@@ -9,6 +9,8 @@
 - `WideStrRef::{starts_with,ends_with,contains}_ascii_ignore_case()`.
 - `Trace::set_flush_timer_ms()` for sub-second realtime delivery, via the
   undocumented `EVENT_TRACE_USE_MS_FLUSH_TIMER` mode bit.
+- Debug builds warn before a MOF schema lookup or provider enumeration that
+  would make TDH create and tear down the process COM MTA.
 
 ### Changed
 

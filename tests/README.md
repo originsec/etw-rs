@@ -304,6 +304,7 @@ data, or live TDH metadata without a session.
 | `validate_all_schemas.rs` | `__register_schema_validator` enqueues validators and `validate_all_schemas()` runs them, propagating the first error |
 | `validate_next_version_hints.rs` | N+1 canary — TDH check that stale index hints are detected |
 | `validate_out_type.rs` | TDH check that an ANSI field's `@ out(...)` must match the manifest's out-type |
+| `mta_warning.rs` | Debug builds warn before a MOF schema lookup or provider enumeration that would create the process COM MTA; quiet for manifest lookups and once the MTA is pinned |
 
 Provider generation is tested in its own crate, in
 `tools/generate-provider/tests/generate_provider.rs`: the generation pipeline and

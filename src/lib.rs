@@ -52,6 +52,7 @@ extern crate self as etw;
 
 pub mod event;
 pub use session::{system_logger, system_logger::stack_walk};
+mod mta;
 pub mod parser;
 pub mod processing_context;
 pub mod resolve;

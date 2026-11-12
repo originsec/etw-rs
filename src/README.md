@@ -10,6 +10,7 @@ Library source for etw-rs. The public API is re-exported from `lib.rs`.
 | `event.rs` | `RawEvent` wrapper around Win32 `EVENT_RECORD`, extended data, timestamps |
 | `parser.rs` | Dynamic TDH-based parser (`EventParser`, `Property`, `FromProperty` and `FromPropertyRef` traits) |
 | `resolve.rs` | Provider name/GUID lookup (`provider_guid_from_name`, `provider_name_from_guid`) |
+| `mta.rs` | Debug-build warning before a TDH call that would create the process MTA |
 | `processing_context.rs` | Caches TDH `TRACE_EVENT_INFO` lookups by (GUID, discriminator, version, pointer size, classic flag) |
 | `static_schema.rs` | Zero-cost compile-time parsing via `event_schema!` macro |
 | `types.rs` | Core types: `TdhInType`, `TdhOutType`, `WideStrRef`, `AnsiStrRef`, `Guid`, `Sid`, `SystemTime` |
@@ -44,6 +45,13 @@ Per-property costs are rough averages over the [BENCHMARKS.md](../BENCHMARKS.md)
 - Only the two bitness bits and `CLASSIC_HEADER` are keyed; no other flag bit distinguishes schemas that reach this cache.
 - **TraceLogging (self-describing) events cannot use this key** — their `Id`/`Version`/`Opcode` are ~always 0, so every event from a provider would collide. They live in a **separate cache** keyed by the raw `EVENT_HEADER_EXT_TYPE_EVENT_SCHEMA_TL` metadata blob **bytes** (the blob *is* the schema; the bytes, not a hash, so distinct schemas never collide). Pointer size still matters, so — mirroring the manifest key's bitness bit — the cache is split into a 32-bit and a 64-bit map. The blob is looked up borrowed so hits allocate nothing; the owned key is built only on a miss.
 - **The caller states which regime applies**: `context.parser()` goes straight to the manifest/MOF cache, `context.tracelogging_parser()` to the blob-keyed one. A provider is one or the other as a fixed property, known when it is enabled, so neither path inspects extended data to work it out per event. A TraceLogging event reaching `parser()` would collide on an empty `EventDescriptor`; a `debug_assert!` catches that in debug builds and costs the release hot path nothing.
+
+### TDH and the Process MTA
+- etw-rs makes no COM calls of its own, but TDH does. Every TDH path that reaches WMI runs `CoInitializeEx(COINIT_MULTITHREADED)` … `CoUninitialize` on the calling thread, balanced per thread (an STA caller is left alone). If no thread holds the MTA, that pair creates the process MTA and destroys it on return, disconnecting COM objects other threads created in the implicit MTA meanwhile.
+- `TdhGetEventInformation` routes to WMI exactly when `EVENT_HEADER_FLAG_CLASSIC_HEADER` is set and `EVENT_HEADER_FLAG_TRACE_MESSAGE` (WPP) is clear; manifest and TraceLogging events never touch COM. TDH caches each MOF class per process, failed lookups included, so this happens once per class. `DecodingSource == DecodingSourceWbem` reports the same routing, but only on success.
+- `TdhEnumerateProviders` (`resolve.rs`) churns the MTA twice per call with no caching. That includes `EnabledProvider`'s `Debug`, which resolves a GUID-only provider's name.
+- Before each such call `mta::warn_if_no_mta` logs a debug-build warning if the calling thread has no apartment, i.e. no thread held the MTA at the time of the check, so the call will likely create it. The check is a snapshot: another thread's transient hold (e.g. a concurrent TDH call) can hide one occurrence, and a pin taken just after the check can fake one. Pinning the MTA (`CoIncrementMTAUsage`) silences it. It is a warning, not an assertion: the churn is safe in isolation and only races code relying on the implicit MTA at that moment, which etw-rs cannot see.
+- Verified on tdh.dll 10.0.26100.9818 by disassembly (`WBEM_SERVICE::Connect`/`~WBEM_SERVICE`, `TdhpGetTraceEventInfoFromMofInfo`) and a probe. Re-probe before relying on it for another build.
 
 ### Parser Cache State Machine
 - Properties split into fixed prefix (cached once per schema) and variable suffix (recomputed per event).

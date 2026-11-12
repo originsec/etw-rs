@@ -47,9 +47,9 @@ use windows_sys::Win32::{
     Foundation::{ERROR_INSUFFICIENT_BUFFER, ERROR_SUCCESS},
     System::Diagnostics::Etw::{
         EVENT_HEADER_FLAG_32_BIT_HEADER, EVENT_HEADER_FLAG_64_BIT_HEADER,
-        EVENT_HEADER_FLAG_CLASSIC_HEADER, EVENT_PROPERTY_INFO, EVENT_RECORD, PROPERTY_FLAGS,
-        PropertyParamCount, PropertyParamLength, PropertyStruct, TRACE_EVENT_INFO,
-        TdhGetEventInformation,
+        EVENT_HEADER_FLAG_CLASSIC_HEADER, EVENT_HEADER_FLAG_TRACE_MESSAGE, EVENT_PROPERTY_INFO,
+        EVENT_RECORD, PROPERTY_FLAGS, PropertyParamCount, PropertyParamLength, PropertyStruct,
+        TRACE_EVENT_INFO, TdhGetEventInformation,
     },
 };
 
@@ -697,6 +697,16 @@ type CachedSchema = (EventSchema, ParserCache);
 ///
 /// Note: This cache is not `Sync` or `Send`. Use separate caches per thread,
 /// or wrap in a mutex if shared access is required.
+///
+/// # COM
+///
+/// TDH reads a classic (MOF) event's schema from WMI, so the first lookup of each
+/// MOF class initialises the COM multithreaded apartment on the calling thread
+/// and uninitialises it on return. If no thread in the process holds the MTA,
+/// that creates the MTA and then destroys it, disconnecting COM objects other
+/// threads created in the implicit MTA meanwhile. A process that uses COM should
+/// pin the MTA with `CoIncrementMTAUsage` before consuming MOF events. Debug
+/// builds log a warning when no thread holds the MTA just before a lookup.
 pub struct ProcessingContext {
     /// Manifest and MOF events, keyed by [`SchemaKey`] (provider GUID + packed
     /// discriminator / version / flags, pointer size included).
@@ -961,6 +971,19 @@ impl ProcessingContext {
 ///
 /// Returns error if the schema cannot be found or TDH API fails.
 fn lookup_event_schema(event: &EVENT_RECORD) -> Result<EventSchema> {
+    // TDH reads a classic schema from WMI; WPP (trace-message) events go to its TMF cache instead.
+    let flags = u32::from(event.EventHeader.Flags);
+    if flags & EVENT_HEADER_FLAG_CLASSIC_HEADER != 0 && flags & EVENT_HEADER_FLAG_TRACE_MESSAGE == 0
+    {
+        let descriptor = &event.EventHeader.EventDescriptor;
+        crate::mta::warn_if_no_mta(format_args!(
+            "TdhGetEventInformation for MOF class {} version {} opcode {}",
+            crate::Guid::from_sys(event.EventHeader.ProviderId),
+            descriptor.Version,
+            descriptor.Opcode,
+        ));
+    }
+
     let mut buffer_size: u32 = 0;
 
     // First call to determine required buffer size

@@ -1573,8 +1573,9 @@ impl<'a> EventParser<'a> {
     ///
     /// # Errors
     ///
-    /// Returns error if the property is not found, is not an array, is a struct
-    /// array, or if element data cannot be parsed.
+    /// Returns error if the property is not found, is not an array (see
+    /// [`PropertyInfo::is_array`](crate::processing_context::PropertyInfo::is_array)), is a
+    /// struct array, or if element data cannot be parsed.
     pub fn array_elements(&mut self, name: &str) -> Result<Vec<Property<'a>>> {
         let index = self.find_property_by_name(name)?;
 
@@ -1589,7 +1590,9 @@ impl<'a> EventParser<'a> {
             )));
         }
 
-        // Determine array count
+        if !prop.is_array() {
+            return Err(Error::parse(format!("Property '{name}' is not an array")));
+        }
         let array_count = if prop.has_param_count() {
             let count = self.get_length_from_property(prop.count_property_index())? as usize;
             if count == 0 {
@@ -1597,14 +1600,7 @@ impl<'a> EventParser<'a> {
             }
             count
         } else {
-            let count = prop.count() as usize;
-            // count == 0 means scalar (not an array)
-            if count == 0 {
-                return Err(Error::parse(format!(
-                    "Property '{name}' is not an array (count == 0)"
-                )));
-            }
-            count
+            prop.count() as usize
         };
 
         // Ensure the array property location is cached
@@ -5236,7 +5232,6 @@ mod position_tests {
 
     #[test]
     fn array_elements_on_non_array_property_errors() {
-        // count == 0 (scalar) → "not an array"
         let data = 42u32.to_le_bytes();
         let (schema, mut cache) = MockSchemaBuilder::new()
             .add("Pid", TdhInType::UInt32, TdhOutType::Null)
@@ -5270,6 +5265,33 @@ mod position_tests {
         assert_eq!(elems.len(), 4);
         let collected: Vec<u32> = elems.iter().map(|p| p.get::<u32>().unwrap()).collect();
         assert_eq!(collected, vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn array_elements_mof_static_array_without_fixed_count_flag() {
+        let data = [10u32, 20, 30].map(u32::to_le_bytes).concat();
+        let (schema, mut cache) = MockSchemaBuilder::new()
+            .add_mof_static_array("Vals", TdhInType::UInt32, TdhOutType::Null, 3)
+            .build_with_cache();
+        let mut parser = EventParser::from_raw_parts(&data, &schema, &mut cache);
+        let elems = parser.array_elements("Vals").unwrap();
+        let collected: Vec<u32> = elems.iter().map(|p| p.get::<u32>().unwrap()).collect();
+        assert_eq!(collected, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn declared_one_element_array_is_an_array_and_reads_as_scalar() {
+        let data = [7u32, 99].map(u32::to_le_bytes).concat();
+        let (schema, mut cache) = MockSchemaBuilder::new()
+            .add_static_array("One", TdhInType::UInt32, TdhOutType::Null, 1)
+            .add("After", TdhInType::UInt32, TdhOutType::Null)
+            .build_with_cache();
+        let mut parser = EventParser::from_raw_parts(&data, &schema, &mut cache);
+        let elems = parser.array_elements("One").unwrap();
+        assert_eq!(elems.len(), 1);
+        assert_eq!(elems[0].get::<u32>().unwrap(), 7);
+        assert_eq!(parser.get::<u32>("One").unwrap(), 7);
+        assert_eq!(parser.get::<u32>("After").unwrap(), 99);
     }
 
     // =========================================================================

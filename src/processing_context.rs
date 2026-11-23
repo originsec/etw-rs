@@ -48,8 +48,8 @@ use windows_sys::Win32::{
     System::Diagnostics::Etw::{
         EVENT_HEADER_FLAG_32_BIT_HEADER, EVENT_HEADER_FLAG_64_BIT_HEADER,
         EVENT_HEADER_FLAG_CLASSIC_HEADER, EVENT_HEADER_FLAG_TRACE_MESSAGE, EVENT_PROPERTY_INFO,
-        EVENT_RECORD, PROPERTY_FLAGS, PropertyParamCount, PropertyParamLength, PropertyStruct,
-        TRACE_EVENT_INFO, TdhGetEventInformation,
+        EVENT_RECORD, PROPERTY_FLAGS, PropertyParamCount, PropertyParamFixedCount,
+        PropertyParamLength, PropertyStruct, TRACE_EVENT_INFO, TdhGetEventInformation,
     },
 };
 
@@ -644,8 +644,10 @@ impl PropertyInfo<'_> {
         unsafe { self.property.Anonymous1.structType.NumOfStructMembers }
     }
 
-    /// Returns the raw TDH count field. A value of 0 means scalar (treat as 1);
-    /// values > 1 indicate a static array. Not valid when `has_param_count()` is true.
+    /// Returns the raw TDH static element count: 1 for a scalar, and the element
+    /// count for a static array, which may itself be 1. A count of 1 alone does
+    /// not make a property scalar; use [`is_array`](Self::is_array). Not valid
+    /// when `has_param_count()` is true.
     pub const fn count(&self) -> u16 {
         // SAFETY: Accessing the count union variant.
         unsafe { self.property.Anonymous2.count }
@@ -665,6 +667,19 @@ impl PropertyInfo<'_> {
     /// property containing the count value.
     pub const fn has_param_count(&self) -> bool {
         (self.property.Flags & PropertyParamCount) != 0
+    }
+
+    /// Returns true if the schema declares this property an array: its count
+    /// comes from another property, or it is a static array.
+    ///
+    /// Manifest and TraceLogging schemas mark every static array with
+    /// `PropertyParamFixedCount`, so a declared one-element array is still an
+    /// array. MOF schemas never set that flag, so there only a count above 1
+    /// marks one, and a one-element MOF array reads as a scalar.
+    pub const fn is_array(&self) -> bool {
+        self.has_param_count()
+            || (self.property.Flags & PropertyParamFixedCount) != 0
+            || self.count() > 1
     }
 
     /// Returns the index of the property containing this property's length.
@@ -1923,20 +1938,51 @@ pub(crate) mod mock {
             self
         }
 
-        /// Adds a top-level property with a static array count > 1.
+        /// Adds a top-level static array as manifest and TraceLogging schemas
+        /// declare it: flagged `PropertyParamFixedCount`, so a count of 1 is
+        /// still an array.
         pub fn add_static_array(
+            self,
+            name: &str,
+            in_type: TdhInType,
+            out_type: TdhOutType,
+            count: u16,
+        ) -> Self {
+            self.push_static_array(
+                name,
+                in_type,
+                out_type,
+                count,
+                PropertyParamFixedCount as u32,
+            )
+        }
+
+        /// Adds a top-level static array as MOF schemas declare it: no
+        /// `PropertyParamFixedCount` flag, only the count.
+        pub fn add_mof_static_array(
+            self,
+            name: &str,
+            in_type: TdhInType,
+            out_type: TdhOutType,
+            count: u16,
+        ) -> Self {
+            self.push_static_array(name, in_type, out_type, count, 0)
+        }
+
+        fn push_static_array(
             mut self,
             name: &str,
             in_type: TdhInType,
             out_type: TdhOutType,
             count: u16,
+            flags: u32,
         ) -> Self {
             self.properties.push(MockProperty {
                 name: name.to_owned(),
                 in_type,
                 out_type,
                 length: 0,
-                flags: 0,
+                flags,
                 length_property_index: 0,
                 count_property_index: 0,
                 static_count: count,
@@ -1959,7 +2005,11 @@ pub(crate) mod mock {
                 in_type: TdhInType::Null,
                 out_type: TdhOutType::Null,
                 length: 0,
-                flags: 0x1, // PropertyStruct
+                flags: if struct_count > 1 {
+                    (PropertyStruct | PropertyParamFixedCount) as u32
+                } else {
+                    PropertyStruct as u32
+                },
                 length_property_index: 0,
                 count_property_index: 0,
                 static_count: struct_count,
@@ -2058,8 +2108,8 @@ pub(crate) mod mock {
                     if prop.flags & 0x4 != 0 {
                         // PropertyParamCount: Anonymous2 holds countPropertyIndex
                         epi.Anonymous2.countPropertyIndex = prop.count_property_index;
-                    } else if prop.static_count > 1 {
-                        epi.Anonymous2.count = prop.static_count;
+                    } else {
+                        epi.Anonymous2.count = prop.static_count.max(1);
                     }
 
                     string_offset += name_data.len();
@@ -2091,9 +2141,7 @@ pub(crate) mod mock {
                         epi.Anonymous1.nonStructType.InType = in_type.raw_value();
                         epi.Anonymous1.nonStructType.OutType = out_type.raw_value();
                         epi.Anonymous3.length = *length;
-                        if *count > 1 {
-                            epi.Anonymous2.count = *count;
-                        }
+                        epi.Anonymous2.count = (*count).max(1);
 
                         string_offset += name_data.len();
                         member_idx += 1;

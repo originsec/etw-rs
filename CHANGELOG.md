@@ -11,6 +11,7 @@
   undocumented `EVENT_TRACE_USE_MS_FLUSH_TIMER` mode bit.
 - Debug builds warn before a MOF schema lookup or provider enumeration that
   would make TDH create and tear down the process COM MTA.
+- `PropertyInfo::is_array()`, true for a property the schema declares an array.
 
 ### Changed
 
@@ -28,6 +29,8 @@
   properties after it. The latter reads as missing (`is_missing()`) and displays
   as `0`.
 - `array_elements()` returns an error instead of panicking on a truncated SID.
+- `array_elements()` rejects a scalar property instead of returning it as a
+  one-element array.
 
 ## [0.1.0] - 2026-10-23
 

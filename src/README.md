@@ -58,6 +58,7 @@ Per-property costs are rough averages over the [BENCHMARKS.md](../BENCHMARKS.md)
 - `current_offset` tracks the next unparsed byte. If it gets out of sync, all subsequent properties read garbage.
 - The out-type is not cached in `PropertyLocation`. `get()` reads it from the schema only when `FromProperty::reads_out_type` says the type needs it for that in-type (today `String` on an ANSI string). Caching it would widen every location entry on the `get()` hot path to serve a rare read.
 - A property's length is per element: its size is length × element count, whether each comes from the schema or from another property (`PropertyParamLength` / `PropertyParamCount`). Measured against TDH by the `ParamLengthAndCount` and `ParamLengthStaticCount` differential fixtures.
+- `count == 1` does not mean scalar. TDH reports every scalar with a static count of 1, never 0, and manifest and TraceLogging schemas also declare one-element arrays (`[1]`, flagged `PropertyParamFixedCount`). MOF schemas never set that flag, even on `[192]` arrays. `PropertyInfo::is_array` combines the three signals; test fixtures must write a count of 1 for scalars, as `MockSchemaBuilder` does. Probed on tdh.dll 10.0.26100.9818 across every registered manifest provider, every WMI event class, and a captured TraceLogging event.
 
 ### ETW Truncation Handling
 - ETW can omit trailing zero bytes for numeric fields. Always zero-extend when reading.

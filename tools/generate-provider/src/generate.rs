@@ -841,6 +841,14 @@ fn resolve_fields(fields: &[EventFieldInfo]) -> FieldResolution {
                 let element_type = intype_to_rust_type(field, fields)
                     .unwrap_or_else(|| format!("InType {}", field.in_type));
                 commented.push(format!("[{index}] {name}: [{element_type}]"));
+            } else if field.count > 1 {
+                let count = field.count;
+                let element = if (field.flags & PROPERTY_STRUCT) != 0 {
+                    "Struct"
+                } else {
+                    intype_name(field.in_type)
+                };
+                commented.push(format!("[{index}] {name}: [{element}; {count}]"));
             } else if let Some(rt) = intype_to_rust_type(field, fields) {
                 commented.push(format!("[{index}] {name}: {rt}"));
             } else {
@@ -854,15 +862,18 @@ fn resolve_fields(fields: &[EventFieldInfo]) -> FieldResolution {
             let has_param_count = (field.flags & PROPERTY_PARAM_COUNT) != 0;
             let type_label = if has_param_count {
                 "Struct[]".to_owned()
+            } else if field.count > 1 {
+                format!("Struct[{}]", field.count)
             } else {
                 "Struct".to_owned()
             };
             match (field.struct_byte_size, has_param_count) {
                 (Some(size), false) => {
                     // Non-counted struct — emit as fixed_length binary blob
+                    let total = size * u32::from(field.count.max(1));
                     emittable.push(ResolvedField {
                         name,
-                        rust_type: format!("u8 @ fixed_length({size})"),
+                        rust_type: format!("u8 @ fixed_length({total})"),
                         index,
                         in_type_name: type_label,
                     });
@@ -921,6 +932,31 @@ fn resolve_fields(fields: &[EventFieldInfo]) -> FieldResolution {
             commented.push(format!(
                 "[{index}] {name}: [{element_type}] (variable-count variable-element-length array)"
             ));
+            continue;
+        }
+
+        // Static array: one blob, so later offsets stay right; `@ tdh` keeps the
+        // element in-type checkable by `validate_schema`.
+        if field.count > 1 {
+            let array_type_name = format!("{}[{}]", intype_name(field.in_type), field.count);
+            if let Some(size) = field.fixed_byte_size() {
+                let rust_type = match field.in_type {
+                    14 => format!("u8 @ fixed_length({size})"),
+                    15 => format!("u8 @ fixed_length({size}) @ tdh(Guid)"),
+                    in_type => format!("u8 @ fixed_length({size}) @ tdh({})", intype_name(in_type)),
+                };
+                emittable.push(ResolvedField {
+                    name,
+                    rust_type,
+                    index,
+                    in_type_name: array_type_name,
+                });
+            } else {
+                hit_unsupported = true;
+                commented.push(format!(
+                    "[{index}] {name}: {array_type_name} (static array of variable- or pointer-sized elements)"
+                ));
+            }
             continue;
         }
 
@@ -1026,7 +1062,7 @@ fn intype_to_rust_type(field: &EventFieldInfo, all_fields: &[EventFieldInfo]) ->
         19 => Some("SidRef".to_owned()),      // SID
         306 => {
             // UnicodeChar — single WCHAR or fixed-length WCHAR array
-            let byte_len = field.effective_byte_length(2);
+            let byte_len = field.fixed_byte_size()?;
             if byte_len <= 2 {
                 Some("u16".to_owned())
             } else {
@@ -1035,7 +1071,7 @@ fn intype_to_rust_type(field: &EventFieldInfo, all_fields: &[EventFieldInfo]) ->
         }
         307 => {
             // AnsiChar — single byte or fixed-length CHAR array
-            let byte_len = field.effective_byte_length(1);
+            let byte_len = field.fixed_byte_size()?;
             if byte_len <= 1 {
                 Some("u8".to_owned())
             } else {
@@ -3043,5 +3079,76 @@ mod tests {
                 "WideStrRef",
             ]
         );
+    }
+
+    fn static_array(name: &str, in_type: u16, count: u16, length: u16) -> EventFieldInfo {
+        EventFieldInfo {
+            count,
+            length,
+            ..field(name, in_type, 0)
+        }
+    }
+
+    #[test]
+    fn static_arrays_span_every_element() {
+        let FieldResolution::Resolved {
+            emittable,
+            commented,
+        } = resolve_fields(&[
+            // Microsoft-Antimalware-Engine event 1: UInt8 Id[16], length 1.
+            static_array("Id", 4, 16, 1),
+            // Microsoft-Windows-Kernel-Processor-Power event 81: Binary[26] × 8.
+            static_array("TotalTimes", 14, 26, 8),
+            static_array("Words", 8, 3, 0),
+            static_array("Ids", 15, 2, 0),
+            EventFieldInfo {
+                flags: super::PROPERTY_STRUCT,
+                struct_byte_size: Some(12),
+                ..static_array("Points", 0, 4, 0)
+            },
+            // `count="1"` is a scalar on the wire.
+            static_array("One", 8, 1, 4),
+            field("After", 8, 0),
+        ])
+        else {
+            panic!("fields should resolve");
+        };
+        assert!(commented.is_empty(), "{commented:?}");
+        let types: Vec<_> = emittable.into_iter().map(|f| f.rust_type).collect();
+        assert_eq!(
+            types,
+            [
+                "u8 @ fixed_length(16) @ tdh(UInt8)",
+                "u8 @ fixed_length(208)",
+                "u8 @ fixed_length(12) @ tdh(UInt32)",
+                "u8 @ fixed_length(32) @ tdh(Guid)",
+                "u8 @ fixed_length(48)",
+                "u32",
+                "u32",
+            ]
+        );
+    }
+
+    #[test]
+    fn unsizable_static_arrays_end_resolution() {
+        for array in [
+            static_array("Ptrs", 16, 2, 8),
+            static_array("Names", 1, 2, 0),
+            EventFieldInfo {
+                flags: super::PROPERTY_PARAM_LENGTH,
+                length_property_index: Some(0),
+                ..static_array("Blobs", 14, 2, 0)
+            },
+        ] {
+            let FieldResolution::Resolved {
+                emittable,
+                commented,
+            } = resolve_fields(&[field("Len", 8, 0), array, field("After", 8, 0)])
+            else {
+                panic!("fields should resolve");
+            };
+            assert_eq!(emittable.len(), 1, "{commented:?}");
+            assert_eq!(commented.len(), 2, "{commented:?}");
+        }
     }
 }

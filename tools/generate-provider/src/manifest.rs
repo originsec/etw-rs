@@ -88,7 +88,8 @@ pub struct EventFieldInfo {
     /// If [`PROPERTY_PARAM_LENGTH`] is set in `flags`, this is the index of the
     /// field that contains the length value.
     pub length_property_index: Option<u16>,
-    /// Fixed array element count (1 = scalar, >1 = fixed-length array).
+    /// Fixed array element count (1 = scalar, >1 = fixed-length array). TDH
+    /// reports a `count="1"` array as 1 too; on the wire it is a scalar.
     ///
     /// Only valid when [`PROPERTY_PARAM_COUNT`] is NOT set in `flags`.
     /// When set, use [`count_property_index`](Self::count_property_index) instead.
@@ -108,17 +109,23 @@ pub struct EventFieldInfo {
 }
 
 impl EventFieldInfo {
-    /// Returns the effective byte length for this field given a per-element byte size.
+    /// Total byte size of a non-struct field whose size the schema fixes: the
+    /// per-element `length` (else the in-type's intrinsic size) times the static
+    /// `count`, as TDH sizes it.
     ///
-    /// Uses the property's `length` if set, otherwise falls back to `count * element_size`.
-    /// A count of 0 is treated as 1 (scalar).
-    pub const fn effective_byte_length(&self, element_size: u16) -> u16 {
-        if self.length > 0 {
-            self.length
-        } else {
-            let count = if self.count == 0 { 1 } else { self.count };
-            count * element_size
+    /// `None` for a variable-length or pointer-sized in-type, or a
+    /// [`PROPERTY_PARAM_LENGTH`] field, whose size only the event fixes.
+    pub fn fixed_byte_size(&self) -> Option<u32> {
+        // Pointer and SizeT follow the event's bitness, which `length` does not track.
+        if self.flags & PROPERTY_PARAM_LENGTH != 0 || matches!(self.in_type, 16 | 308) {
+            return None;
         }
+        let element = if self.length > 0 {
+            u32::from(self.length)
+        } else {
+            intype_fixed_byte_size(self.in_type)?
+        };
+        Some(element * u32::from(self.count.max(1)))
     }
 }
 
@@ -823,7 +830,7 @@ fn get_provider_field_info(
 /// Returns the fixed byte size for a TDH InType, or `None` for variable-length types.
 ///
 /// Assumes 64-bit pointer size for Pointer/SizeT types.
-const fn intype_fixed_byte_size(in_type: u16) -> Option<u32> {
+pub(crate) const fn intype_fixed_byte_size(in_type: u16) -> Option<u32> {
     match in_type {
         // Int8, UInt8, AnsiChar
         3 | 4 | 307 => Some(1),

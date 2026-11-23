@@ -31,6 +31,8 @@
 - `array_elements()` returns an error instead of panicking on a truncated SID.
 - `array_elements()` rejects a scalar property instead of returning it as a
   one-element array.
+- `generate-provider` sizes a static array by all its elements, not one, so the
+  fields after it no longer read from the wrong offset.
 
 ## [0.1.0] - 2026-10-23
 
